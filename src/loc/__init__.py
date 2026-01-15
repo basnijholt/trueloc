@@ -705,28 +705,52 @@ def count(  # noqa: PLR0913
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
+            TextColumn("[cyan]{task.fields[status]}[/cyan]"),
             console=console,
         ) as progress,
     ):
         gh = GitHubClient(client, cache)
 
-        fetch_task = progress.add_task("Fetching repositories...", total=None)
+        # Fetch repos
+        fetch_task = progress.add_task("Fetching repositories...", total=None, status="")
         repos = gh.get_user_repos(username)
         progress.remove_task(fetch_task)
 
-        repo_task = progress.add_task("Processing repos", total=len(repos))
+        # Main repo progress
+        repo_task = progress.add_task(
+            f"[bold]Repos[/bold] (0/{len(repos)})", total=len(repos), status=""
+        )
 
-        for repo in repos:
-            progress.update(repo_task, description=f"[cyan]{repo}[/cyan]")
+        for repo_idx, repo in enumerate(repos, 1):
+            short_repo = repo.split("/")[-1][:20]
+            progress.update(
+                repo_task,
+                description=f"[bold]Repos[/bold] ({repo_idx}/{len(repos)})",
+                status=short_repo,
+            )
 
-            for pr in gh.get_merged_prs(repo, username, since_date):
-                merged_at = datetime.fromisoformat(pr["merged_at"])
-                if merged_at.replace(tzinfo=None) > until_date:
-                    continue
-                _process_pr(gh, repo, pr, per_commit, aggregator, include_direct_commits)
+            # Fetch PRs for this repo
+            prs = [
+                pr
+                for pr in gh.get_merged_prs(repo, username, since_date)
+                if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) <= until_date
+            ]
 
+            if prs:
+                pr_task = progress.add_task(
+                    "  PRs", total=len(prs), status=f"0/{len(prs)}"
+                )
+                for pr in prs:
+                    progress.update(pr_task, status=f"#{pr['number']}")
+                    _process_pr(gh, repo, pr, per_commit, aggregator, include_direct_commits)
+                    progress.advance(pr_task)
+                progress.remove_task(pr_task)
+
+            # Process direct commits
             if include_direct_commits:
+                commit_task = progress.add_task("  Direct commits", total=None, status="")
                 _process_direct_commits(gh, repo, username, since_date, until_date, aggregator)
+                progress.remove_task(commit_task)
 
             progress.advance(repo_task)
 
