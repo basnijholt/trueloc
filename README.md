@@ -53,6 +53,9 @@ loc count USERNAME --since 2023-01-01 --no-extensions
 # Disable caching (fresh API calls)
 loc count USERNAME --since 2023-01-01 --no-cache
 
+# Output as JSON for scripting/postprocessing
+loc count USERNAME --since 2023-01-01 --json
+
 # Clear the cache
 loc clear-cache
 ```
@@ -63,6 +66,7 @@ loc clear-cache
 - **Net diff mode**: Alternative mode that only counts final diff (`--net`)
 - **Direct commits**: Includes commits pushed directly to main (not via PR)
 - **File extension breakdown**: Shows which languages you've worked with
+- **JSON output**: Machine-readable output for scripting (`--json`)
 - **Disk caching**: Uses diskcache to avoid hammering the GitHub API
 - **Rate limit handling**: Automatically waits when rate limited with progress bar
 - **Flexible dates**: Supports relative (`5d`, `2w`, `3m`, `1y`) and natural language (`last month`)
