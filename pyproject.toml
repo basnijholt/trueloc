@@ -53,8 +53,11 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 
+[tool.ty.rules]
+unused-ignore-comment = "ignore"
+
 [dependency-groups]
-dev = ["mypy>=1.14", "pre-commit>=4", "ruff>=0.9", "pytest>=8", "pytest-cov>=4", "respx>=0.21"]
+dev = ["mypy>=1.14", "pre-commit>=4", "ruff>=0.9", "pytest>=8", "pytest-cov>=4", "respx>=0.21", "ty"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

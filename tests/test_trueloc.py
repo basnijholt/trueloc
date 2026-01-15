@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture
-def memory_cache(tmp_path: Path) -> diskcache.Cache:
+def memory_cache(tmp_path: Path) -> Generator[diskcache.Cache, None, None]:
     """Create an isolated cache for testing using a temp directory."""
     cache = diskcache.Cache(tmp_path / "test_cache")
     yield cache
