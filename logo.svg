@@ -26,13 +26,13 @@
         fill="none" stroke="#64748b" stroke-width="6" stroke-linecap="round"/>
 
   <!-- Plus sign (additions) -->
-  <g transform="translate(68, 55)">
+  <g transform="translate(78, 55)">
     <rect x="8" y="0" width="6" height="22" rx="2" fill="url(#greenGrad)"/>
     <rect x="0" y="8" width="22" height="6" rx="2" fill="url(#greenGrad)"/>
   </g>
 
   <!-- Minus sign (deletions) -->
-  <g transform="translate(110, 55)">
+  <g transform="translate(108, 55)">
     <rect x="0" y="8" width="22" height="6" rx="2" fill="url(#redGrad)"/>
   </g>
 
@@ -49,7 +49,7 @@
   </g>
 
   <!-- Checkmark for "true" -->
-  <path d="M 82 176 L 94 188 L 118 164"
+  <path d="M 82 158 L 94 170 L 118 146"
         fill="none" stroke="#4ade80" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
 
   <!-- Text: trueloc -->
