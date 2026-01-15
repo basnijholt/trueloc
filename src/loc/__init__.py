@@ -238,30 +238,6 @@ def get_branch_commits(  # noqa: PLR0913
     return result
 
 
-def is_commit_from_pr(
-    client: httpx.Client,
-    cache: diskcache.Cache,
-    repo: str,
-    sha: str,
-) -> bool:
-    """Check if a commit is associated with a PR."""
-    cache_key = f"commit_pr_assoc:{repo}:{sha}"
-
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached  # type: ignore[no-any-return]
-
-    response = client.get(f"/repos/{repo}/commits/{sha}/pulls")
-    response.raise_for_status()
-    prs = response.json()
-
-    # If commit is associated with any merged PR, it came from a PR
-    is_from_pr = any(pr.get("merged_at") is not None for pr in prs)
-
-    cache.set(cache_key, is_from_pr)  # Immutable - commit association doesn't change
-    return is_from_pr
-
-
 def get_pr_commits(
     client: httpx.Client,
     cache: diskcache.Cache,
@@ -589,6 +565,7 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
     total_deletions = 0
     total_by_extension: dict[str, FileStats] = defaultdict(FileStats)
     cache_hits = 0
+    pr_commit_shas: set[str] = set()  # Track all commits from PRs to filter direct commits
 
     cache = get_cache() if not no_cache else diskcache.Cache(":memory:")
     get_stats = get_pr_stats_per_commit if per_commit else get_pr_stats_net
@@ -625,6 +602,11 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
                 if was_cached:
                     cache_hits += 1
 
+                # Track PR commit SHAs for filtering direct commits later
+                if include_direct_commits:
+                    pr_commits = get_pr_commits(client, cache, repo, pr["number"])
+                    pr_commit_shas.update(pr_commits)
+
                 for ext, ext_stats in by_ext.items():
                     total_by_extension[ext].additions += ext_stats.additions
                     total_by_extension[ext].deletions += ext_stats.deletions
@@ -653,8 +635,8 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
 
                     for commit in branch_commits:
                         sha = commit["sha"]
-                        # Check if this commit came from a PR
-                        if is_commit_from_pr(client, cache, repo, sha):
+                        # Skip if this commit came from a PR (local check, no API call)
+                        if sha in pr_commit_shas:
                             continue
 
                         # This is a direct commit
