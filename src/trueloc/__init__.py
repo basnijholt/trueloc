@@ -24,7 +24,11 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
-app = typer.Typer(help="Count lines of code from GitHub pull requests.")
+app = typer.Typer(
+    help="Count lines of code from GitHub pull requests.",
+    context_settings={"help_option_names": ["-h", "--help"]},
+    no_args_is_help=True,
+)
 console = Console()
 
 CACHE_DIR = Path.home() / ".cache" / "trueloc"
