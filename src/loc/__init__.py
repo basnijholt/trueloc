@@ -179,6 +179,7 @@ class GitHubClient:
         max_retries: int = 3,
     ) -> httpx.Response:
         """Make a request with rate limit handling."""
+        response: httpx.Response | None = None
         for _attempt in range(max_retries):
             response = self.client.get(endpoint, params=params)
 
@@ -190,8 +191,11 @@ class GitHubClient:
             self._check_rate_limit_buffer(response)
             return response
 
-        response.raise_for_status()
-        return response  # Never reached, but keeps type checker happy
+        # Exhausted retries - raise the last response's error or a generic one
+        if response is not None:
+            response.raise_for_status()
+        msg = f"Request to {endpoint} failed after {max_retries} retries"
+        raise httpx.HTTPStatusError(msg, request=None, response=None)  # type: ignore[arg-type]
 
     def _paginate(
         self,
