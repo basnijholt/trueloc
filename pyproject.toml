@@ -31,6 +31,22 @@ ignore = [
     "T20",     # print statements (we use them for CLI)
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S101",    # assert usage is fine in tests
+    "PLR2004", # magic values are fine in tests
+    "S105",    # hardcoded passwords (test tokens)
+    "PLC0415", # import not at top level (test isolation)
+    "TC002",   # type-checking imports
+    "TC003",   # type-checking imports
+    "TC005",   # empty type-checking block
+    "SLF001",  # private member access (testing internals)
+    "DTZ001",  # datetime without tzinfo (test data)
+    "ARG005",  # unused lambda args (test mocks)
+    "EM101",   # string literal in exception (test helpers)
+    "FBT003",  # boolean positional (calling internal APIs)
+]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
@@ -38,4 +54,19 @@ warn_return_any = true
 warn_unused_configs = true
 
 [dependency-groups]
-dev = ["mypy>=1.14", "pre-commit>=4", "ruff>=0.9"]
+dev = ["mypy>=1.14", "pre-commit>=4", "ruff>=0.9", "pytest>=8", "pytest-cov>=4", "respx>=0.21"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=loc --cov-report=term-missing --cov-report=html"
+
+[tool.coverage.run]
+source = ["src/loc"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
