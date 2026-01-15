@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
+import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -264,9 +266,7 @@ class GitHubClient:
                 result.append(pr)
         return result
 
-    def _filter_prs_since(
-        self, prs: list[dict[str, Any]], since: datetime
-    ) -> list[dict[str, Any]]:
+    def _filter_prs_since(self, prs: list[dict[str, Any]], since: datetime) -> list[dict[str, Any]]:
         """Filter PRs to only those merged on or after the given date."""
         return [
             pr
@@ -274,9 +274,7 @@ class GitHubClient:
             if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) >= since
         ]
 
-    def _save_pr_cache(
-        self, cache_key: str, since: datetime, prs: list[dict[str, Any]]
-    ) -> None:
+    def _save_pr_cache(self, cache_key: str, since: datetime, prs: list[dict[str, Any]]) -> None:
         """Save PRs to cache with the given watermark date."""
         self.cache.set(
             cache_key,
@@ -705,6 +703,62 @@ def _display_summary(aggregator: StatsAggregator, since: str, *, per_commit: boo
         )
 
 
+def _output_json(
+    aggregator: StatsAggregator,
+    username: str,
+    since: str,
+    until: str | None,
+    *,
+    per_commit: bool,
+) -> None:
+    """Output results as JSON to stdout."""
+
+    # Convert FileStats to dicts
+    def ext_to_dict(by_ext: dict[str, FileStats]) -> dict[str, dict[str, int]]:
+        return {ext: asdict(stats) for ext, stats in by_ext.items()}
+
+    output = {
+        "username": username,
+        "since": since,
+        "until": until,
+        "mode": "per_commit" if per_commit else "net_diff",
+        "prs": [
+            {
+                "repo": pr.repo,
+                "pr_number": pr.pr_number,
+                "title": pr.title,
+                "merged_at": pr.merged_at,
+                "additions": pr.additions,
+                "deletions": pr.deletions,
+                "by_extension": ext_to_dict(pr.by_extension),
+            }
+            for pr in aggregator.prs
+        ],
+        "direct_commits": [
+            {
+                "repo": c.repo,
+                "sha": c.sha,
+                "message": c.message,
+                "committed_at": c.committed_at,
+                "additions": c.additions,
+                "deletions": c.deletions,
+                "by_extension": ext_to_dict(c.by_extension),
+            }
+            for c in aggregator.direct_commits
+        ],
+        "summary": {
+            "total_prs": len(aggregator.prs),
+            "total_direct_commits": len(aggregator.direct_commits),
+            "total_additions": aggregator.total_additions,
+            "total_deletions": aggregator.total_deletions,
+            "total_lines": aggregator.total_additions + aggregator.total_deletions,
+            "by_extension": ext_to_dict(dict(aggregator.by_extension)),
+        },
+    }
+    json.dump(output, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
 # =============================================================================
 # CLI Commands
 # =============================================================================
@@ -736,6 +790,11 @@ def count(  # noqa: PLR0913
         "--direct-commits/--no-direct-commits",
         help="Include direct commits to main branch (not from PRs)",
     ),
+    output_json: bool = typer.Option(
+        False,  # noqa: FBT003
+        "--json",
+        help="Output results as JSON for scripting",
+    ),
 ) -> None:
     """Count lines of code from merged PRs and direct commits.
 
@@ -766,6 +825,7 @@ def count(  # noqa: PLR0913
             TaskProgressColumn(),
             TextColumn("[cyan]{task.fields[status]}[/cyan]"),
             console=console,
+            disable=output_json,  # Suppress progress when outputting JSON
         ) as progress,
     ):
         gh = GitHubClient(client, cache)
@@ -796,9 +856,7 @@ def count(  # noqa: PLR0913
             ]
 
             if prs:
-                pr_task = progress.add_task(
-                    "  PRs", total=len(prs), status=f"0/{len(prs)}"
-                )
+                pr_task = progress.add_task("  PRs", total=len(prs), status=f"0/{len(prs)}")
                 for pr in prs:
                     progress.update(pr_task, status=f"#{pr['number']}")
                     _process_pr(gh, repo, pr, per_commit, aggregator, include_direct_commits)
@@ -813,20 +871,23 @@ def count(  # noqa: PLR0913
 
             progress.advance(repo_task)
 
-    if aggregator.prs:
-        _display_pr_table(aggregator.prs, username, since, until)
+    if output_json:
+        _output_json(aggregator, username, since, until, per_commit=per_commit)
+    else:
+        if aggregator.prs:
+            _display_pr_table(aggregator.prs, username, since, until)
 
-    if aggregator.direct_commits:
-        console.print()
-        _display_direct_commits_table(aggregator.direct_commits, username, since, until)
+        if aggregator.direct_commits:
+            console.print()
+            _display_direct_commits_table(aggregator.direct_commits, username, since, until)
 
-    if show_extensions and aggregator.by_extension:
-        console.print()
-        _display_extension_table(
-            aggregator.by_extension, aggregator.total_additions, aggregator.total_deletions
-        )
+        if show_extensions and aggregator.by_extension:
+            console.print()
+            _display_extension_table(
+                aggregator.by_extension, aggregator.total_additions, aggregator.total_deletions
+            )
 
-    _display_summary(aggregator, since, per_commit=per_commit)
+        _display_summary(aggregator, since, per_commit=per_commit)
 
 
 @app.command()
