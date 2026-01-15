@@ -269,17 +269,21 @@ def get_pr_commits(
 
     commits: list[str] = []
     page = 1
-    while True:
-        response = client.get(
-            f"/repos/{repo}/pulls/{pr_number}/commits",
-            params={"per_page": 100, "page": page},
-        )
-        response.raise_for_status()
-        page_commits: list[dict[str, Any]] = response.json()
-        if not page_commits:
-            break
-        commits.extend(c["sha"] for c in page_commits)
-        page += 1
+    try:
+        while True:
+            response = client.get(
+                f"/repos/{repo}/pulls/{pr_number}/commits",
+                params={"per_page": 100, "page": page},
+            )
+            response.raise_for_status()
+            page_commits: list[dict[str, Any]] = response.json()
+            if not page_commits:
+                break
+            commits.extend(c["sha"] for c in page_commits)
+            page += 1
+    except (httpx.HTTPStatusError, httpx.TimeoutException):
+        # Rate limited or timeout - return what we have
+        pass
 
     cache.set(cache_key, commits)
     return commits
@@ -300,8 +304,12 @@ def get_commit_stats(
         cached_by_ext = {ext: FileStats(add, del_) for ext, (add, del_) in ext_data.items()}
         return total_add, total_del, cached_by_ext
 
-    response = client.get(f"/repos/{repo}/commits/{sha}")
-    response.raise_for_status()
+    try:
+        response = client.get(f"/repos/{repo}/commits/{sha}")
+        response.raise_for_status()
+    except (httpx.HTTPStatusError, httpx.TimeoutException):
+        # Rate limited or timeout - return empty stats
+        return 0, 0, {}
     commit_data = response.json()
 
     by_extension: dict[str, FileStats] = defaultdict(FileStats)
@@ -379,17 +387,21 @@ def get_pr_stats_net(
     if files is None:
         files = []
         page = 1
-        while True:
-            response = client.get(
-                f"/repos/{repo}/pulls/{pr_number}/files",
-                params={"per_page": 100, "page": page},
-            )
-            response.raise_for_status()
-            page_files: list[dict[str, Any]] = response.json()
-            if not page_files:
-                break
-            files.extend(page_files)
-            page += 1
+        try:
+            while True:
+                response = client.get(
+                    f"/repos/{repo}/pulls/{pr_number}/files",
+                    params={"per_page": 100, "page": page},
+                )
+                response.raise_for_status()
+                page_files: list[dict[str, Any]] = response.json()
+                if not page_files:
+                    break
+                files.extend(page_files)
+                page += 1
+        except (httpx.HTTPStatusError, httpx.TimeoutException):
+            # Rate limited or timeout - return what we have
+            pass
         cache.set(files_cache_key, files)
 
     by_extension: dict[str, FileStats] = defaultdict(FileStats)
