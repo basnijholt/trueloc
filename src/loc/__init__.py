@@ -574,7 +574,7 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
     cache_prefix = "pr_stats_per_commit" if per_commit else "pr_stats_net"
 
     with (
-        httpx.Client(base_url="https://api.github.com", headers=headers) as client,
+        httpx.Client(base_url="https://api.github.com", headers=headers, timeout=30.0) as client,
         Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -660,8 +660,8 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
                         )
                         total_additions += additions
                         total_deletions += deletions
-                except httpx.HTTPStatusError:
-                    # Some repos might not have commits or access issues
+                except (httpx.HTTPStatusError, httpx.TimeoutException):
+                    # Some repos might not have commits or access issues, or timeout
                     pass
 
     if all_stats:
