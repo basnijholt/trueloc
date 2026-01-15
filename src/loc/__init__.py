@@ -26,6 +26,7 @@ console = Console()
 CACHE_DIR = Path.home() / ".cache" / "loc"
 TTL_MUTABLE = 86400  # 1 day for mutable data
 TTL_IMMUTABLE = None  # Never expires for immutable data
+RATE_LIMIT_BUFFER = 500  # Proactively pause when remaining requests drop below this
 
 
 # =============================================================================
@@ -169,6 +170,16 @@ class GitHubClient:
                     continue  # Retry after waiting
 
             response.raise_for_status()
+
+            # Proactively pause if approaching rate limit
+            remaining = int(response.headers.get("X-RateLimit-Remaining", "9999"))
+            if remaining < RATE_LIMIT_BUFFER:
+                console.print(
+                    f"[yellow]Approaching rate limit ({remaining} remaining). "
+                    f"Pausing to preserve buffer...[/yellow]"
+                )
+                self._wait_for_rate_limit(response)
+
             return response
 
         # If we exhausted retries, raise the last error
