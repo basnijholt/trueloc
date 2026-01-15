@@ -233,30 +233,79 @@ class GitHubClient:
 
         return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
 
+    def _fetch_prs_in_range(
+        self,
+        repo: str,
+        username: str,
+        since: datetime,
+        until: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch merged PRs in a date range from the API."""
+        result = []
+        params = {"state": "closed", "sort": "updated", "direction": "desc"}
+        for pr in self._paginate(f"/repos/{repo}/pulls", params):
+            if pr["merged_at"] is None:
+                continue
+            merged_at = datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None)
+            if merged_at < since:
+                continue
+            if until and merged_at >= until:
+                continue
+            if pr["user"]["login"] == username:
+                result.append(pr)
+        return result
+
     def get_merged_prs(
         self,
         repo: str,
         username: str,
         since: datetime,
     ) -> list[dict[str, Any]]:
-        """Get merged PRs for a repo by a user since a date."""
-        since_str = since.strftime("%Y-%m-%d")
-        cache_key = f"merged_prs:{repo}:{username}:{since_str}"
+        """Get merged PRs for a repo by a user since a date.
 
-        def fetch() -> list[dict[str, Any]]:
-            result = []
-            params = {"state": "closed", "sort": "updated", "direction": "desc"}
-            for pr in self._paginate(f"/repos/{repo}/pulls", params):
-                if pr["merged_at"] is None:
-                    continue
-                merged_at = datetime.fromisoformat(pr["merged_at"])
-                if merged_at.replace(tzinfo=None) < since:
-                    continue
-                if pr["user"]["login"] == username:
-                    result.append(pr)
-            return result
+        Uses smart range-aware caching:
+        - If cached range covers requested range, filter locally (instant)
+        - If requesting older data, fetch only the gap and merge
+        """
+        cache_key = f"merged_prs_v2:{repo}:{username}"
+        cached = self.cache.get(cache_key)
 
-        return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
+        if cached is not None:
+            cached_since_str, prs = cached["cached_since"], cached["prs"]
+            cached_since = datetime.fromisoformat(cached_since_str)
+
+            if since >= cached_since:
+                # Requested range is within cached range - filter locally!
+                return [
+                    pr
+                    for pr in prs
+                    if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) >= since
+                ]
+
+            # Requesting older data - fetch the gap and merge
+            gap_prs = self._fetch_prs_in_range(repo, username, since, cached_since)
+            all_prs = gap_prs + prs
+
+            # Update cache with extended range
+            self.cache.set(
+                cache_key,
+                {"cached_since": since.isoformat(), "prs": all_prs},
+                expire=TTL_MUTABLE,
+            )
+            return [
+                pr
+                for pr in all_prs
+                if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) >= since
+            ]
+
+        # No cache - fetch and store
+        prs = self._fetch_prs_in_range(repo, username, since)
+        self.cache.set(
+            cache_key,
+            {"cached_since": since.isoformat(), "prs": prs},
+            expire=TTL_MUTABLE,
+        )
+        return prs
 
     def get_default_branch(self, repo: str) -> str | None:
         """Get the default branch for a repository."""
