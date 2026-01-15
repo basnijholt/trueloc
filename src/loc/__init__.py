@@ -90,17 +90,21 @@ def get_user_repos(
 
     repos: list[str] = []
     page = 1
-    while True:
-        response = client.get(
-            f"/users/{username}/repos",
-            params={"per_page": 100, "page": page, "type": "owner"},
-        )
-        response.raise_for_status()
-        page_repos = response.json()
-        if not page_repos:
-            break
-        repos.extend(repo["full_name"] for repo in page_repos)
-        page += 1
+    try:
+        while True:
+            response = client.get(
+                f"/users/{username}/repos",
+                params={"per_page": 100, "page": page, "type": "owner"},
+            )
+            response.raise_for_status()
+            page_repos = response.json()
+            if not page_repos:
+                break
+            repos.extend(repo["full_name"] for repo in page_repos)
+            page += 1
+    except (httpx.HTTPStatusError, httpx.TimeoutException):
+        # Rate limited or timeout - return what we have
+        pass
 
     cache.set(cache_key, repos, expire=TTL_MUTABLE)
     return repos
@@ -124,38 +128,42 @@ def get_merged_prs(  # noqa: C901
 
     result: list[dict[str, Any]] = []
     page = 1
-    while True:
-        response = client.get(
-            f"/repos/{repo}/pulls",
-            params={
-                "state": "closed",
-                "per_page": 100,
-                "page": page,
-                "sort": "updated",
-                "direction": "desc",
-            },
-        )
-        response.raise_for_status()
-        prs: list[dict[str, Any]] = response.json()
-        if not prs:
-            break
+    try:
+        while True:
+            response = client.get(
+                f"/repos/{repo}/pulls",
+                params={
+                    "state": "closed",
+                    "per_page": 100,
+                    "page": page,
+                    "sort": "updated",
+                    "direction": "desc",
+                },
+            )
+            response.raise_for_status()
+            prs: list[dict[str, Any]] = response.json()
+            if not prs:
+                break
 
-        for pr in prs:
-            if pr["merged_at"] is None:
-                continue
-            merged_at = datetime.fromisoformat(pr["merged_at"])
-            if merged_at.replace(tzinfo=None) < since:
-                continue
-            if pr["user"]["login"] == username:
-                result.append(pr)
+            for pr in prs:
+                if pr["merged_at"] is None:
+                    continue
+                merged_at = datetime.fromisoformat(pr["merged_at"])
+                if merged_at.replace(tzinfo=None) < since:
+                    continue
+                if pr["user"]["login"] == username:
+                    result.append(pr)
 
-        if prs:
-            oldest = prs[-1]
-            if oldest["updated_at"]:
-                oldest_date = datetime.fromisoformat(oldest["updated_at"])
-                if oldest_date.replace(tzinfo=None) < since:
-                    break
-        page += 1
+            if prs:
+                oldest = prs[-1]
+                if oldest["updated_at"]:
+                    oldest_date = datetime.fromisoformat(oldest["updated_at"])
+                    if oldest_date.replace(tzinfo=None) < since:
+                        break
+            page += 1
+    except (httpx.HTTPStatusError, httpx.TimeoutException):
+        # Rate limited or timeout - return what we have
+        pass
 
     cache.set(cache_key, result, expire=TTL_MUTABLE)
     return result
