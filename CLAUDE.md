@@ -6,13 +6,13 @@ A CLI tool to count how many lines of code you've written via GitHub pull reques
 
 The primary goal is to answer: **"How many lines of code have I written with AI since date X?"**
 
-This tool counts ALL lines touched (not just net diff), so if you add 1000 lines, delete them, and add 1 line, it counts as 2001 lines - representing the actual work done.
+This tool counts ALL lines touched (not just net diff). Example: add 1000 lines, delete them, add 1 line = +1001 / -1000 (not just +1 net). Additions and deletions are summed separately across all commits.
 
 ## How It Works
 
 1. **Fetches all your repositories** from GitHub
 2. **For each merged PR**: Gets all commits in the PR and sums their additions/deletions
-3. **For direct commits**: Gets commits on default branch that aren't from PRs (TODO)
+3. **For direct commits**: Gets commits on default branch that aren't from PRs
 4. **Caches aggressively**: Immutable data (commits, merged PRs) cached forever; mutable data (repo list, PR list) cached for 1 day
 
 ## Key Features
@@ -57,6 +57,6 @@ loc clear-cache
 
 ## TODO
 
-- [ ] Add direct commit counting (commits pushed directly to main, not via PR)
+- [x] Add direct commit counting (commits pushed directly to main, not via PR)
 - [ ] Handle pagination edge cases for very large repos
 - [ ] Add JSON output option for scripting

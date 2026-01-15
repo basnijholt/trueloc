@@ -562,8 +562,8 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
     By default, counts all lines touched across all commits in each PR,
     plus direct commits to the main branch (not from PRs).
 
-    This means if you add 1000 lines, then delete them and add 1 line,
-    it counts as 2001 lines (not just 1 net line).
+    Example: add 1000 lines, delete them, add 1 line = +1001 / -1000
+    (not just +1 net). Additions and deletions are summed separately.
 
     Use --net to count only the final diff (net additions/deletions).
     Use --no-direct-commits to exclude direct commits to main branch.
