@@ -1,5 +1,14 @@
 # trueloc - Lines of Code Counter
 
+[![PyPI](https://img.shields.io/pypi/v/trueloc)](https://pypi.org/project/trueloc/)
+[![Python](https://img.shields.io/pypi/pyversions/trueloc)](https://pypi.org/project/trueloc/)
+[![License](https://img.shields.io/github/license/basnijholt/trueloc)](LICENSE)
+[![Downloads](https://img.shields.io/pypi/dm/trueloc)](https://pypi.org/project/trueloc/)
+[![CI](https://img.shields.io/github/actions/workflow/status/basnijholt/trueloc/pytest.yml?label=tests)](https://github.com/basnijholt/trueloc/actions/workflows/pytest.yml)
+[![Docs](https://img.shields.io/badge/docs-trueloc.nijho.lt-blue)](https://trueloc.nijho.lt)
+
+<img src="https://raw.githubusercontent.com/basnijholt/trueloc/main/logo.svg" alt="trueloc Logo" align="right" style="width: 200px;" />
+
 A CLI tool to count how many lines of code you've written via GitHub pull requests and direct commits.
 
 ## Goal
