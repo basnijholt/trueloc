@@ -609,6 +609,76 @@ class TestGitHubClientPRCaching:
             cached = memory_cache.get(cache_key)
             assert cached["cached_since"] == since_older.isoformat()
 
+    def test_consecutive_non_overlapping_ranges(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """Test scenario: -s 6m -u 5m then -s 5m -u 4m uses cache correctly.
+
+        The cache stores PRs from `since` to NOW, not from `since` to `until`.
+        So when querying a later range, it should use cached data.
+        """
+        # PRs spanning a wide range
+        all_prs = [
+            {"number": 1, "merged_at": "2024-01-25T10:00:00Z", "user": {"login": "testuser"}},
+            {"number": 2, "merged_at": "2024-01-20T10:00:00Z", "user": {"login": "testuser"}},
+            {"number": 3, "merged_at": "2024-01-15T10:00:00Z", "user": {"login": "testuser"}},
+            {"number": 4, "merged_at": "2024-01-10T10:00:00Z", "user": {"login": "testuser"}},
+            {"number": 5, "merged_at": "2024-01-05T10:00:00Z", "user": {"login": "testuser"}},
+        ]
+
+        route = respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=all_prs,
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "2"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+
+            # First query: equivalent to -s Jan 5 -u Jan 11 (end of Jan 10)
+            # (simulating -s 6m -u 5m)
+            since_6m = datetime(2024, 1, 5)
+            until_5m = datetime(2024, 1, 11)  # End of day Jan 10
+            prs_6m_5m = [
+                pr
+                for pr in gh.get_merged_prs("user/repo", "testuser", since_6m)
+                if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) < until_5m
+            ]
+            # Should get PR #5 (Jan 5) and PR #4 (Jan 10)
+            assert len(prs_6m_5m) == 2
+            assert {pr["number"] for pr in prs_6m_5m} == {4, 5}
+            assert route.call_count == 1
+
+            # Second query: equivalent to -s Jan 10 -u Jan 16 (end of Jan 15)
+            # (simulating -s 5m -u 4m)
+            since_5m = datetime(2024, 1, 10)
+            until_4m = datetime(2024, 1, 16)  # End of day Jan 15
+            prs_5m_4m = [
+                pr
+                for pr in gh.get_merged_prs("user/repo", "testuser", since_5m)
+                if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) < until_4m
+            ]
+            # Should get PR #4 (Jan 10), PR #3 (Jan 15)
+            assert len(prs_5m_4m) == 2
+            assert {pr["number"] for pr in prs_5m_4m} == {3, 4}
+            # API should NOT have been called again - data comes from cache
+            assert route.call_count == 1
+
 
 class TestGitHubClientRequest:
     """Tests for GitHubClient._request method."""
