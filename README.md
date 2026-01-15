@@ -1,4 +1,4 @@
-# loc - Lines of Code Counter
+# trueloc - Lines of Code Counter
 
 A CLI tool to count how many lines of code you've written via GitHub pull requests and direct commits.
 
@@ -12,8 +12,8 @@ This tool counts ALL lines touched (not just net diff). For example, a single PR
 
 ```bash
 # Clone and install
-git clone https://github.com/basnijholt/loc.git
-cd loc
+git clone https://github.com/basnijholt/trueloc.git
+cd trueloc
 pip install -e .
 
 # Or with uv
@@ -29,35 +29,35 @@ gh auth login
 
 ```bash
 # Count lines from PRs and direct commits since a date
-loc count USERNAME --since 2023-01-01
+trueloc count USERNAME --since 2023-01-01
 
 # Use relative dates
-loc count USERNAME --since 5d      # 5 days ago
-loc count USERNAME --since 2w      # 2 weeks ago
-loc count USERNAME --since 3m      # 3 months ago
-loc count USERNAME --since 1y      # 1 year ago
-loc count USERNAME --since "last month"
+trueloc count USERNAME --since 5d      # 5 days ago
+trueloc count USERNAME --since 2w      # 2 weeks ago
+trueloc count USERNAME --since 3m      # 3 months ago
+trueloc count USERNAME --since 1y      # 1 year ago
+trueloc count USERNAME --since "last month"
 
 # Specify a date range
-loc count USERNAME --since 2024-01-01 --until 2024-06-30
+trueloc count USERNAME --since 2024-01-01 --until 2024-06-30
 
 # Count only net diff (not per-commit)
-loc count USERNAME --since 2023-01-01 --net
+trueloc count USERNAME --since 2023-01-01 --net
 
 # Exclude direct commits (PRs only)
-loc count USERNAME --since 2023-01-01 --no-direct-commits
+trueloc count USERNAME --since 2023-01-01 --no-direct-commits
 
 # Hide file extension breakdown
-loc count USERNAME --since 2023-01-01 --no-extensions
+trueloc count USERNAME --since 2023-01-01 --no-extensions
 
 # Disable caching (fresh API calls)
-loc count USERNAME --since 2023-01-01 --no-cache
+trueloc count USERNAME --since 2023-01-01 --no-cache
 
 # Output as JSON for scripting/postprocessing
-loc count USERNAME --since 2023-01-01 --json
+trueloc count USERNAME --since 2023-01-01 --json
 
 # Clear the cache
-loc clear-cache
+trueloc clear-cache
 ```
 
 ## Features
@@ -76,7 +76,7 @@ loc clear-cache
 - **Immutable data** (cached forever): commit stats, PR commits, PR files
 - **Mutable data** (1 day TTL): user repos, merged PR lists
 
-Cache is stored in `~/.cache/loc/`.
+Cache is stored in `~/.cache/trueloc/`.
 
 ## Tech Stack
 

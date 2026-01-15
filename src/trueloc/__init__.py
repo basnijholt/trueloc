@@ -27,7 +27,7 @@ from rich.table import Table
 app = typer.Typer(help="Count lines of code from GitHub pull requests.")
 console = Console()
 
-CACHE_DIR = Path.home() / ".cache" / "loc"
+CACHE_DIR = Path.home() / ".cache" / "trueloc"
 TTL_MUTABLE = 86400  # 1 day for mutable data
 TTL_IMMUTABLE = None  # Never expires for immutable data
 RATE_LIMIT_BUFFER = 500  # Proactively pause when remaining requests drop below this

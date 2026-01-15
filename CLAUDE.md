@@ -1,4 +1,4 @@
-# loc - Lines of Code Counter
+# trueloc - Lines of Code Counter
 
 A CLI tool to count how many lines of code you've written via GitHub pull requests and direct commits.
 
@@ -27,13 +27,13 @@ This tool counts ALL lines touched (not just net diff). Example: a single PR whe
 
 ```bash
 # Count lines from PRs since a date
-loc count USERNAME --since 2023-01-01
+trueloc count USERNAME --since 2023-01-01
 
 # Count only net diff (not per-commit)
-loc count USERNAME --since 2023-01-01 --net
+trueloc count USERNAME --since 2023-01-01 --net
 
 # Clear the cache
-loc clear-cache
+trueloc clear-cache
 ```
 
 ## Architecture

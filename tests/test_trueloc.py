@@ -1,4 +1,4 @@
-"""Tests for the loc CLI tool."""
+"""Tests for the trueloc CLI tool."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import httpx
 import pytest
 import respx
 
-from loc import (
+from trueloc import (
     CommitStats,
     FileStats,
     GitHubClient,
@@ -930,7 +930,7 @@ class TestProcessFunctions:
 
     def test_process_pr(self, memory_cache: diskcache.Cache, respx_mock: respx.Router) -> None:
         """Test processing a single PR."""
-        from loc import _process_pr
+        from trueloc import _process_pr
 
         # Mock PR files
         respx_mock.get(
@@ -968,7 +968,7 @@ class TestHelperFunctions:
 
     def test_get_github_token(self) -> None:
         """Test getting GitHub token."""
-        from loc import _get_github_token
+        from trueloc import _get_github_token
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout="test_token\n")
@@ -978,7 +978,7 @@ class TestHelperFunctions:
 
     def test_get_cache_with_no_cache(self) -> None:
         """Test getting in-memory cache."""
-        from loc import _get_cache
+        from trueloc import _get_cache
 
         cache = _get_cache(no_cache=True)
         assert cache is not None
@@ -986,7 +986,7 @@ class TestHelperFunctions:
 
     def test_get_cache_with_disk(self) -> None:
         """Test getting disk cache."""
-        from loc import _get_cache
+        from trueloc import _get_cache
 
         cache = _get_cache(no_cache=False)
         assert cache is not None
@@ -1003,7 +1003,7 @@ class TestCLI:
 
     def test_app_exists(self) -> None:
         """Test that the Typer app exists."""
-        from loc import app
+        from trueloc import app
 
         assert app is not None
 
@@ -1011,7 +1011,7 @@ class TestCLI:
         """Test clear-cache command."""
         from typer.testing import CliRunner
 
-        from loc import app
+        from trueloc import app
 
         runner = CliRunner()
         result = runner.invoke(app, ["clear-cache"])
