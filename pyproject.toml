@@ -5,7 +5,7 @@ description = "Count lines of code from GitHub pull requests"
 readme = "README.md"
 authors = [{ name = "Bas Nijholt", email = "bas@nijho.lt" }]
 requires-python = ">=3.12"
-dependencies = ["typer>=0.15", "httpx>=0.28", "rich>=13", "diskcache>=5"]
+dependencies = ["typer>=0.15", "httpx>=0.28", "rich>=13", "diskcache>=5", "dateparser>=1"]
 
 [project.scripts]
 loc = "loc:app"

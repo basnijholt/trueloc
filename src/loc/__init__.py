@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from collections import defaultdict
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+import dateparser  # type: ignore[import-untyped]
 import diskcache  # type: ignore[import-untyped]
 import httpx
 import typer
@@ -421,6 +423,30 @@ def _get_cache(no_cache: bool) -> diskcache.Cache:  # noqa: FBT001
     return diskcache.Cache(str(CACHE_DIR))
 
 
+def _parse_date(date_str: str) -> datetime:
+    """Parse a date string using dateparser.
+
+    Supports:
+    - Relative: "5d", "2w", "3m", "1y", "5 days ago", "last week", "last month"
+    - Absolute: "2024-01-01", "Jan 1 2024"
+    """
+    # Handle shorthand like "5d", "2w", "3m", "1y"
+    shorthand = re.match(r"^(\d+)([dwmy])$", date_str.strip().lower())
+    if shorthand:
+        num, unit = shorthand.groups()
+        unit_map = {"d": "days", "w": "weeks", "m": "months", "y": "years"}
+        date_str = f"{num} {unit_map[unit]} ago"
+
+    parsed: datetime | None = dateparser.parse(
+        date_str,
+        settings={"PREFER_DATES_FROM": "past", "RETURN_AS_TIMEZONE_AWARE": False},
+    )
+    if parsed is None:
+        msg = f"Could not parse date: {date_str!r}"
+        raise typer.BadParameter(msg)
+    return parsed
+
+
 # =============================================================================
 # Processing Functions
 # =============================================================================
@@ -628,8 +654,12 @@ def _display_summary(aggregator: StatsAggregator, since: str, *, per_commit: boo
 @app.command()
 def count(  # noqa: PLR0913
     username: str = typer.Argument(..., help="GitHub username"),
-    since: str = typer.Option(..., "--since", "-s", help="Start date (YYYY-MM-DD)"),
-    until: str | None = typer.Option(None, "--until", "-u", help="End date (YYYY-MM-DD)"),
+    since: str = typer.Option(
+        ..., "--since", "-s", help="Start date (e.g., 5d, 2w, 3m, 1y, 'last month', 2024-01-01)"
+    ),
+    until: str | None = typer.Option(
+        None, "--until", "-u", help="End date (e.g., 1d, 'yesterday', 2024-12-31)"
+    ),
     *,
     no_cache: bool = typer.Option(False, "--no-cache", help="Disable disk cache"),  # noqa: FBT003
     show_extensions: bool = typer.Option(
@@ -660,8 +690,8 @@ def count(  # noqa: PLR0913
     Use --net to count only the final diff (net additions/deletions).
     Use --no-direct-commits to exclude direct commits to main branch.
     """
-    since_date = datetime.strptime(since, "%Y-%m-%d")  # noqa: DTZ007
-    until_date = datetime.strptime(until, "%Y-%m-%d") if until else datetime.now()  # noqa: DTZ005, DTZ007
+    since_date = _parse_date(since)
+    until_date = _parse_date(until) if until else datetime.now()  # noqa: DTZ005
 
     token = _get_github_token()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
