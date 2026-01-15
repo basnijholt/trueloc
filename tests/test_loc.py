@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
-import diskcache
+import diskcache  # type: ignore[import-untyped]
 import httpx
 import pytest
 import respx
@@ -286,17 +286,13 @@ class TestParseDate:
 class TestGitHubClientRateLimiting:
     """Tests for GitHubClient rate limiting."""
 
-    def test_calc_rate_limit_wait_retry_after(
-        self, gh_client: GitHubClient
-    ) -> None:
+    def test_calc_rate_limit_wait_retry_after(self, gh_client: GitHubClient) -> None:
         """Test rate limit wait calculation with Retry-After header."""
         response = MagicMock()
         response.headers = {"Retry-After": "30", "X-RateLimit-Reset": "0"}
         assert gh_client._calc_rate_limit_wait(response) == 30
 
-    def test_calc_rate_limit_wait_reset_timestamp(
-        self, gh_client: GitHubClient
-    ) -> None:
+    def test_calc_rate_limit_wait_reset_timestamp(self, gh_client: GitHubClient) -> None:
         """Test rate limit wait calculation with reset timestamp."""
         import time
 
@@ -312,9 +308,7 @@ class TestGitHubClientRateLimiting:
         response.headers = {"Retry-After": "0", "X-RateLimit-Reset": "0"}
         assert gh_client._calc_rate_limit_wait(response) == 60
 
-    def test_is_rate_limited_403_no_remaining(
-        self, gh_client: GitHubClient
-    ) -> None:
+    def test_is_rate_limited_403_no_remaining(self, gh_client: GitHubClient) -> None:
         """Test rate limit detection with 403 and no remaining."""
         response = MagicMock()
         response.status_code = 403
@@ -335,9 +329,7 @@ class TestGitHubClientRateLimiting:
         response.headers = {"X-RateLimit-Remaining": "1000"}
         assert gh_client._is_rate_limited(response) is False
 
-    def test_is_rate_limited_403_with_remaining(
-        self, gh_client: GitHubClient
-    ) -> None:
+    def test_is_rate_limited_403_with_remaining(self, gh_client: GitHubClient) -> None:
         """Test 403 with remaining quota is not rate limited."""
         response = MagicMock()
         response.status_code = 403
@@ -348,9 +340,7 @@ class TestGitHubClientRateLimiting:
 class TestGitHubClientAPI:
     """Tests for GitHubClient API methods."""
 
-    def test_get_user_repos(
-        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
-    ) -> None:
+    def test_get_user_repos(self, memory_cache: diskcache.Cache, respx_mock: respx.Router) -> None:
         """Test fetching user repositories."""
         # First page with data
         respx_mock.get(
@@ -526,9 +516,7 @@ class TestGitHubClientPRCaching:
 class TestGitHubClientRequest:
     """Tests for GitHubClient._request method."""
 
-    def test_request_success(
-        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
-    ) -> None:
+    def test_request_success(self, memory_cache: diskcache.Cache, respx_mock: respx.Router) -> None:
         """Test successful request."""
         respx_mock.get("https://api.github.com/test").mock(
             return_value=httpx.Response(
@@ -583,16 +571,12 @@ class TestGitHubClientCachedFetch:
         result = gh_client._cached_fetch("test_key", lambda: "new_value")
         assert result == "cached_value"
 
-    def test_cached_fetch_fetches_when_not_cached(
-        self, gh_client: GitHubClient
-    ) -> None:
+    def test_cached_fetch_fetches_when_not_cached(self, gh_client: GitHubClient) -> None:
         """Test that fetcher is called when not cached."""
         result = gh_client._cached_fetch("new_key", lambda: "fetched_value")
         assert result == "fetched_value"
 
-    def test_cached_fetch_handles_exception(
-        self, gh_client: GitHubClient
-    ) -> None:
+    def test_cached_fetch_handles_exception(self, gh_client: GitHubClient) -> None:
         """Test that exceptions in fetcher return None."""
 
         def bad_fetcher() -> str:
@@ -663,9 +647,7 @@ class TestGitHubClientBranchCommits:
         assert len(commits) == 1
         assert commits[0]["sha"] == "abc123"
 
-    def test_get_pr_commits(
-        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
-    ) -> None:
+    def test_get_pr_commits(self, memory_cache: diskcache.Cache, respx_mock: respx.Router) -> None:
         """Test fetching PR commits."""
         # First page
         respx_mock.get(
@@ -718,11 +700,7 @@ class TestGitHubClientPRStatsPerCommit:
         respx_mock.get(
             "https://api.github.com/repos/user/repo/pulls/123/commits",
             params={"per_page": "100", "page": "2"},
-        ).mock(
-            return_value=httpx.Response(
-                200, json=[], headers={"X-RateLimit-Remaining": "5000"}
-            )
-        )
+        ).mock(return_value=httpx.Response(200, json=[], headers={"X-RateLimit-Remaining": "5000"}))
         # Mock commit stats
         respx_mock.get("https://api.github.com/repos/user/repo/commits/abc123").mock(
             return_value=httpx.Response(
@@ -769,11 +747,7 @@ class TestGitHubClientPRStatsNet:
         respx_mock.get(
             "https://api.github.com/repos/user/repo/pulls/123/files",
             params={"per_page": "100", "page": "2"},
-        ).mock(
-            return_value=httpx.Response(
-                200, json=[], headers={"X-RateLimit-Remaining": "5000"}
-            )
-        )
+        ).mock(return_value=httpx.Response(200, json=[], headers={"X-RateLimit-Remaining": "5000"}))
 
         with httpx.Client(base_url="https://api.github.com") as client:
             gh = GitHubClient(client, memory_cache)
@@ -787,9 +761,7 @@ class TestGitHubClientPRStatsNet:
 class TestProcessFunctions:
     """Tests for _process_pr and _process_direct_commits."""
 
-    def test_process_pr(
-        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
-    ) -> None:
+    def test_process_pr(self, memory_cache: diskcache.Cache, respx_mock: respx.Router) -> None:
         """Test processing a single PR."""
         from loc import _process_pr
 
@@ -807,11 +779,7 @@ class TestProcessFunctions:
         respx_mock.get(
             "https://api.github.com/repos/user/repo/pulls/123/files",
             params={"per_page": "100", "page": "2"},
-        ).mock(
-            return_value=httpx.Response(
-                200, json=[], headers={"X-RateLimit-Remaining": "5000"}
-            )
-        )
+        ).mock(return_value=httpx.Response(200, json=[], headers={"X-RateLimit-Remaining": "5000"}))
 
         with httpx.Client(base_url="https://api.github.com") as client:
             gh = GitHubClient(client, memory_cache)
