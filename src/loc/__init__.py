@@ -124,23 +124,20 @@ class GitHubClient:
         self.client = client
         self.cache = cache
 
-    def _wait_for_rate_limit(self, response: httpx.Response) -> None:
-        """Wait for rate limit to reset, showing countdown progress bar."""
+    def _calc_rate_limit_wait(self, response: httpx.Response) -> int:
+        """Calculate seconds to wait for rate limit reset."""
         reset_timestamp = int(response.headers.get("X-RateLimit-Reset", 0))
         retry_after = int(response.headers.get("Retry-After", 0))
 
-        # Calculate wait time
         if retry_after > 0:
-            wait_seconds = retry_after
-        elif reset_timestamp > 0:
-            wait_seconds = max(0, reset_timestamp - int(time.time()) + 1)
-        else:
-            wait_seconds = 60  # Default fallback
+            return retry_after
+        if reset_timestamp > 0:
+            return max(0, reset_timestamp - int(time.time()) + 1)
+        return 60  # Default fallback
 
-        if wait_seconds <= 0:
-            return
-
-        console.print(f"[yellow]Rate limited. Waiting {wait_seconds}s for reset...[/yellow]")
+    def _show_wait_progress(self, wait_seconds: int, message: str) -> None:
+        """Show a countdown progress bar."""
+        console.print(f"[yellow]{message}[/yellow]")
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -153,6 +150,28 @@ class GitHubClient:
                 time.sleep(1)
                 progress.advance(task)
 
+    def _wait_for_rate_limit(self, response: httpx.Response) -> None:
+        """Wait for rate limit to reset, showing countdown progress bar."""
+        wait_seconds = self._calc_rate_limit_wait(response)
+        if wait_seconds > 0:
+            msg = f"Rate limited. Waiting {wait_seconds}s for reset..."
+            self._show_wait_progress(wait_seconds, msg)
+
+    def _is_rate_limited(self, response: httpx.Response) -> bool:
+        """Check if response indicates rate limiting."""
+        rate_limit_codes = (403, 429)  # Forbidden, Too Many Requests
+        if response.status_code not in rate_limit_codes:
+            return False
+        remaining = response.headers.get("X-RateLimit-Remaining", "1")
+        return remaining == "0" or response.status_code == rate_limit_codes[1]
+
+    def _check_rate_limit_buffer(self, response: httpx.Response) -> None:
+        """Proactively pause if approaching rate limit buffer."""
+        remaining = int(response.headers.get("X-RateLimit-Remaining", "9999"))
+        if remaining < RATE_LIMIT_BUFFER:
+            msg = f"Approaching rate limit ({remaining} remaining). Pausing to preserve buffer..."
+            self._show_wait_progress(self._calc_rate_limit_wait(response), msg)
+
     def _request(
         self,
         endpoint: str,
@@ -163,28 +182,14 @@ class GitHubClient:
         for _attempt in range(max_retries):
             response = self.client.get(endpoint, params=params)
 
-            # Check for rate limiting (403 Forbidden or 429 Too Many Requests)
-            rate_limit_codes = (403, 429)
-            if response.status_code in rate_limit_codes:
-                remaining = response.headers.get("X-RateLimit-Remaining", "1")
-                if remaining == "0" or response.status_code == rate_limit_codes[1]:
-                    self._wait_for_rate_limit(response)
-                    continue  # Retry after waiting
+            if self._is_rate_limited(response):
+                self._wait_for_rate_limit(response)
+                continue
 
             response.raise_for_status()
-
-            # Proactively pause if approaching rate limit
-            remaining = int(response.headers.get("X-RateLimit-Remaining", "9999"))
-            if remaining < RATE_LIMIT_BUFFER:
-                console.print(
-                    f"[yellow]Approaching rate limit ({remaining} remaining). "
-                    f"Pausing to preserve buffer...[/yellow]"
-                )
-                self._wait_for_rate_limit(response)
-
+            self._check_rate_limit_buffer(response)
             return response
 
-        # If we exhausted retries, raise the last error
         response.raise_for_status()
         return response  # Never reached, but keeps type checker happy
 
@@ -255,6 +260,26 @@ class GitHubClient:
                 result.append(pr)
         return result
 
+    def _filter_prs_since(
+        self, prs: list[dict[str, Any]], since: datetime
+    ) -> list[dict[str, Any]]:
+        """Filter PRs to only those merged on or after the given date."""
+        return [
+            pr
+            for pr in prs
+            if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) >= since
+        ]
+
+    def _save_pr_cache(
+        self, cache_key: str, since: datetime, prs: list[dict[str, Any]]
+    ) -> None:
+        """Save PRs to cache with the given watermark date."""
+        self.cache.set(
+            cache_key,
+            {"cached_since": since.isoformat(), "prs": prs},
+            expire=TTL_MUTABLE,
+        )
+
     def get_merged_prs(
         self,
         repo: str,
@@ -270,42 +295,23 @@ class GitHubClient:
         cache_key = f"merged_prs_v2:{repo}:{username}"
         cached = self.cache.get(cache_key)
 
-        if cached is not None:
-            cached_since_str, prs = cached["cached_since"], cached["prs"]
-            cached_since = datetime.fromisoformat(cached_since_str)
+        if cached is None:
+            prs = self._fetch_prs_in_range(repo, username, since)
+            self._save_pr_cache(cache_key, since, prs)
+            return prs
 
-            if since >= cached_since:
-                # Requested range is within cached range - filter locally!
-                return [
-                    pr
-                    for pr in prs
-                    if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) >= since
-                ]
+        cached_since = datetime.fromisoformat(cached["cached_since"])
+        prs = cached["prs"]
 
-            # Requesting older data - fetch the gap and merge
-            gap_prs = self._fetch_prs_in_range(repo, username, since, cached_since)
-            all_prs = gap_prs + prs
+        # Requested range is within cached range - filter locally!
+        if since >= cached_since:
+            return self._filter_prs_since(prs, since)
 
-            # Update cache with extended range
-            self.cache.set(
-                cache_key,
-                {"cached_since": since.isoformat(), "prs": all_prs},
-                expire=TTL_MUTABLE,
-            )
-            return [
-                pr
-                for pr in all_prs
-                if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) >= since
-            ]
-
-        # No cache - fetch and store
-        prs = self._fetch_prs_in_range(repo, username, since)
-        self.cache.set(
-            cache_key,
-            {"cached_since": since.isoformat(), "prs": prs},
-            expire=TTL_MUTABLE,
-        )
-        return prs
+        # Requesting older data - fetch the gap and merge
+        gap_prs = self._fetch_prs_in_range(repo, username, since, cached_since)
+        all_prs = gap_prs + prs
+        self._save_pr_cache(cache_key, since, all_prs)
+        return self._filter_prs_since(all_prs, since)
 
     def get_default_branch(self, repo: str) -> str | None:
         """Get the default branch for a repository."""
