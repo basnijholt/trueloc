@@ -6,7 +6,7 @@ A CLI tool to count how many lines of code you've written via GitHub pull reques
 
 The primary goal is to answer: **"How many lines of code have I written with AI since date X?"**
 
-This tool counts ALL lines touched (not just net diff). Example: add 1000 lines, delete them, add 1 line = +1001 / -1000 (not just +1 net). Additions and deletions are summed separately across all commits.
+This tool counts ALL lines touched (not just net diff). Example: a single PR where you add 1000 lines, delete them, then add 1 line = +1001 / -1000 (even though the PR's net diff shows only +1). Additions and deletions are summed separately across all commits.
 
 ## How It Works
 

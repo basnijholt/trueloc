@@ -13,7 +13,7 @@ import diskcache  # type: ignore[import-untyped]
 import httpx
 import typer
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 
 app = typer.Typer(help="Count lines of code from GitHub pull requests.")
@@ -562,8 +562,9 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
     By default, counts all lines touched across all commits in each PR,
     plus direct commits to the main branch (not from PRs).
 
-    Example: add 1000 lines, delete them, add 1 line = +1001 / -1000
-    (not just +1 net). Additions and deletions are summed separately.
+    Example: a single PR where you add 1000 lines, delete them, then add
+    1 line = +1001 / -1000 (even though the PR's net diff shows only +1).
+    Additions and deletions are summed separately across all commits.
 
     Use --net to count only the final diff (net additions/deletions).
     Use --no-direct-commits to exclude direct commits to main branch.
@@ -590,15 +591,19 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
         Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
             console=console,
         ) as progress,
     ):
-        task = progress.add_task("Fetching repositories...", total=None)
+        fetch_task = progress.add_task("Fetching repositories...", total=None)
         repos = get_user_repos(client, cache, username)
-        progress.update(task, description=f"Found {len(repos)} repositories")
+        progress.remove_task(fetch_task)
+
+        repo_task = progress.add_task("Processing repos", total=len(repos))
 
         for repo in repos:
-            progress.update(task, description=f"Processing {repo}...")
+            progress.update(repo_task, description=f"[cyan]{repo}[/cyan]")
 
             # Process PRs
             for pr in get_merged_prs(client, cache, repo, username, since_date):
@@ -632,7 +637,6 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
 
             # Process direct commits (not from PRs)
             if include_direct_commits:
-                progress.update(task, description=f"Checking direct commits in {repo}...")
                 try:
                     default_branch = get_default_branch(client, cache, repo)
                     branch_commits = get_branch_commits(
@@ -675,6 +679,8 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
                 except (httpx.HTTPStatusError, httpx.TimeoutException):
                     # Some repos might not have commits or access issues, or timeout
                     pass
+
+            progress.advance(repo_task)
 
     if all_stats:
         display_pr_table(all_stats, username, since, until)
