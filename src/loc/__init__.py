@@ -351,31 +351,79 @@ class GitHubClient:
 
         return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
 
-    def get_pr_commits(self, repo: str, pr_number: int) -> list[str]:
-        """Get all commit SHAs in a PR."""
-        cache_key = f"pr_commits:{repo}:{pr_number}"
+    def get_pr_commits_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        """Get all commits in a PR (raw API response, cached forever)."""
+        cache_key = f"pr_commits_raw:{repo}:{pr_number}"
 
-        def fetch() -> list[str]:
-            return [c["sha"] for c in self._paginate(f"/repos/{repo}/pulls/{pr_number}/commits")]
+        def fetch() -> list[dict[str, Any]]:
+            return list(self._paginate(f"/repos/{repo}/pulls/{pr_number}/commits"))
 
         return self._cached_fetch(cache_key, fetch, TTL_IMMUTABLE) or []
 
-    def get_commit_stats(self, repo: str, sha: str) -> tuple[int, int, dict[str, FileStats]]:
-        """Get additions and deletions for a single commit."""
-        cache_key = f"commit_stats:{repo}:{sha}"
+    def get_pr_commits(self, repo: str, pr_number: int) -> list[str]:
+        """Get all commit SHAs in a PR."""
+        return [c["sha"] for c in self.get_pr_commits_raw(repo, pr_number)]
+
+    def get_commit_raw(self, repo: str, sha: str) -> dict[str, Any] | None:
+        """Get full commit data (raw API response, cached forever)."""
+        cache_key = f"commit_raw:{repo}:{sha}"
 
         cached = self.cache.get(cache_key)
+        if cached is not None:
+            result: dict[str, Any] = cached
+            return result
+
+        try:
+            response = self._request(f"/repos/{repo}/commits/{sha}")
+        except (httpx.HTTPStatusError, httpx.TimeoutException):
+            return None
+
+        data: dict[str, Any] = response.json()
+        self.cache.set(cache_key, data, expire=TTL_IMMUTABLE)
+        return data
+
+    def get_commit_stats(self, repo: str, sha: str) -> tuple[int, int, dict[str, FileStats]]:
+        """Get additions and deletions for a single commit.
+
+        Uses cached raw commit data, also caches processed stats for speed.
+        """
+        # Check processed cache first (fast path)
+        stats_cache_key = f"commit_stats:{repo}:{sha}"
+        cached = self.cache.get(stats_cache_key)
         if cached is not None:
             total_add, total_del, ext_data = cached
             by_ext = {ext: FileStats.from_tuple(t) for ext, t in ext_data.items()}
             return total_add, total_del, by_ext
 
-        try:
-            response = self._request(f"/repos/{repo}/commits/{sha}")
-        except (httpx.HTTPStatusError, httpx.TimeoutException):
+        # Get raw data (cached separately for flexibility)
+        raw = self.get_commit_raw(repo, sha)
+        if raw is None:
             return 0, 0, {}
 
-        return self._parse_file_stats(response.json().get("files", []), cache_key)
+        # Extract and cache processed stats
+        result = self._extract_file_stats(raw.get("files", []))
+        ext_data = {ext: stats.to_tuple() for ext, stats in result[2].items()}
+        self.cache.set(stats_cache_key, (result[0], result[1], ext_data), expire=TTL_IMMUTABLE)
+        return result
+
+    def get_pr_files_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        """Get all files changed in a PR (raw API response, cached forever)."""
+        cache_key = f"pr_files_raw:{repo}:{pr_number}"
+
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            result: list[dict[str, Any]] = cached
+            return result
+
+        try:
+            files: list[dict[str, Any]] = list(
+                self._paginate(f"/repos/{repo}/pulls/{pr_number}/files")
+            )
+        except (httpx.HTTPStatusError, httpx.TimeoutException):
+            files = []
+
+        self.cache.set(cache_key, files, expire=TTL_IMMUTABLE)
+        return files
 
     def get_pr_stats_per_commit(
         self, repo: str, pr_number: int
@@ -406,33 +454,32 @@ class GitHubClient:
         return total_additions, total_deletions, dict(by_extension)
 
     def get_pr_stats_net(self, repo: str, pr_number: int) -> tuple[int, int, dict[str, FileStats]]:
-        """Get net additions/deletions for a PR (final diff only)."""
-        cache_key = f"pr_stats_net:{repo}:{pr_number}"
+        """Get net additions/deletions for a PR (final diff only).
 
-        cached = self.cache.get(cache_key)
+        Uses cached raw PR files, also caches processed stats for speed.
+        """
+        # Check processed cache first (fast path)
+        stats_cache_key = f"pr_stats_net:{repo}:{pr_number}"
+        cached = self.cache.get(stats_cache_key)
         if cached is not None:
             total_add, total_del, ext_data = cached
             by_ext = {ext: FileStats.from_tuple(t) for ext, t in ext_data.items()}
             return total_add, total_del, by_ext
 
-        # Fetch PR files
-        files_cache_key = f"pr_files:{repo}:{pr_number}"
-        files = self.cache.get(files_cache_key)
-        if files is None:
-            try:
-                files = list(self._paginate(f"/repos/{repo}/pulls/{pr_number}/files"))
-            except (httpx.HTTPStatusError, httpx.TimeoutException):
-                files = []
-            self.cache.set(files_cache_key, files)
+        # Get raw files (cached separately for flexibility)
+        files = self.get_pr_files_raw(repo, pr_number)
 
-        return self._parse_file_stats(files, cache_key)
+        # Extract and cache processed stats
+        result = self._extract_file_stats(files)
+        ext_data = {ext: stats.to_tuple() for ext, stats in result[2].items()}
+        self.cache.set(stats_cache_key, (result[0], result[1], ext_data), expire=TTL_IMMUTABLE)
+        return result
 
-    def _parse_file_stats(
+    def _extract_file_stats(
         self,
         files: list[dict[str, Any]],
-        cache_key: str,
     ) -> tuple[int, int, dict[str, FileStats]]:
-        """Parse file stats from API response and cache result."""
+        """Extract file stats from API response (no caching, pure extraction)."""
         by_extension: dict[str, FileStats] = defaultdict(FileStats)
         total_additions = 0
         total_deletions = 0
@@ -446,8 +493,6 @@ class GitHubClient:
             total_additions += additions
             total_deletions += deletions
 
-        ext_data = {ext: stats.to_tuple() for ext, stats in by_extension.items()}
-        self.cache.set(cache_key, (total_additions, total_deletions, ext_data))
         return total_additions, total_deletions, dict(by_extension)
 
 
