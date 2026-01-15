@@ -7,7 +7,10 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 import diskcache  # type: ignore[import-untyped]
 import httpx
@@ -20,26 +23,13 @@ app = typer.Typer(help="Count lines of code from GitHub pull requests.")
 console = Console()
 
 CACHE_DIR = Path.home() / ".cache" / "loc"
-
-# Cache TTL in seconds (1 day for mutable data, None for immutable)
-TTL_MUTABLE = 86400  # 1 day
-TTL_IMMUTABLE = None  # Never expires
+TTL_MUTABLE = 86400  # 1 day for mutable data
+TTL_IMMUTABLE = None  # Never expires for immutable data
 
 
-def get_cache() -> diskcache.Cache:
-    """Get or create the disk cache."""
-    return diskcache.Cache(str(CACHE_DIR))
-
-
-def get_github_token() -> str:
-    """Get GitHub token from gh CLI."""
-    result = subprocess.run(
-        ["gh", "auth", "token"],  # noqa: S607
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return result.stdout.strip()
+# =============================================================================
+# Data Classes
+# =============================================================================
 
 
 @dataclass
@@ -48,6 +38,15 @@ class FileStats:
 
     additions: int = 0
     deletions: int = 0
+
+    def to_tuple(self) -> tuple[int, int]:
+        """Convert to tuple for caching."""
+        return (self.additions, self.deletions)
+
+    @classmethod
+    def from_tuple(cls, data: tuple[int, int]) -> FileStats:
+        """Create from cached tuple."""
+        return cls(additions=data[0], deletions=data[1])
 
 
 @dataclass
@@ -76,76 +75,111 @@ class CommitStats:
     by_extension: dict[str, FileStats] = field(default_factory=dict)
 
 
-def get_user_repos(
-    client: httpx.Client,
-    cache: diskcache.Cache,
-    username: str,
-) -> list[str]:
-    """Get all repositories for a user (cached with TTL)."""
-    cache_key = f"user_repos:{username}"
+@dataclass
+class StatsAggregator:
+    """Aggregates statistics across PRs and commits."""
 
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached  # type: ignore[no-any-return]
+    prs: list[PRStats] = field(default_factory=list)
+    direct_commits: list[CommitStats] = field(default_factory=list)
+    total_additions: int = 0
+    total_deletions: int = 0
+    by_extension: dict[str, FileStats] = field(default_factory=lambda: defaultdict(FileStats))
+    cache_hits: int = 0
+    pr_commit_shas: set[str] = field(default_factory=set)
 
-    repos: list[str] = []
-    page = 1
-    try:
+    def add_extension_stats(self, by_ext: dict[str, FileStats]) -> None:
+        """Merge extension stats into totals."""
+        for ext, stats in by_ext.items():
+            self.by_extension[ext].additions += stats.additions
+            self.by_extension[ext].deletions += stats.deletions
+
+    def add_pr(self, pr: PRStats) -> None:
+        """Add a PR and update totals."""
+        self.prs.append(pr)
+        self.total_additions += pr.additions
+        self.total_deletions += pr.deletions
+        self.add_extension_stats(pr.by_extension)
+
+    def add_commit(self, commit: CommitStats) -> None:
+        """Add a direct commit and update totals."""
+        self.direct_commits.append(commit)
+        self.total_additions += commit.additions
+        self.total_deletions += commit.deletions
+        self.add_extension_stats(commit.by_extension)
+
+
+# =============================================================================
+# GitHub Client with Caching
+# =============================================================================
+
+
+class GitHubClient:
+    """GitHub API client with caching and pagination."""
+
+    def __init__(self, client: httpx.Client, cache: diskcache.Cache) -> None:
+        self.client = client
+        self.cache = cache
+
+    def _paginate(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Paginate through API results, yielding each item."""
+        params = params or {}
+        page = 1
         while True:
-            response = client.get(
-                f"/users/{username}/repos",
-                params={"per_page": 100, "page": page, "type": "owner"},
-            )
+            response = self.client.get(endpoint, params={**params, "per_page": 100, "page": page})
             response.raise_for_status()
-            page_repos = response.json()
-            if not page_repos:
+            items = response.json()
+            if not items:
                 break
-            repos.extend(repo["full_name"] for repo in page_repos)
+            yield from items
             page += 1
-    except (httpx.HTTPStatusError, httpx.TimeoutException):
-        # Rate limited or timeout - return what we have
-        pass
 
-    cache.set(cache_key, repos, expire=TTL_MUTABLE)
-    return repos
+    def _cached_fetch(
+        self,
+        cache_key: str,
+        fetcher: Callable[[], Any],
+        ttl: int | None = TTL_IMMUTABLE,
+    ) -> Any:
+        """Fetch with caching, gracefully handling API errors."""
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return cached
 
+        try:
+            result = fetcher()
+        except (httpx.HTTPStatusError, httpx.TimeoutException):
+            return None
 
-def get_merged_prs(  # noqa: C901
-    client: httpx.Client,
-    cache: diskcache.Cache,
-    repo: str,
-    username: str,
-    since: datetime,
-) -> list[dict[str, Any]]:
-    """Get all merged PRs for a repo by a user since a date (cached with TTL)."""
-    # Cache key includes the since date (rounded to day for better cache hits)
-    since_str = since.strftime("%Y-%m-%d")
-    cache_key = f"merged_prs:{repo}:{username}:{since_str}"
+        self.cache.set(cache_key, result, expire=ttl)
+        return result
 
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached  # type: ignore[no-any-return]
+    def get_user_repos(self, username: str) -> list[str]:
+        """Get all repositories for a user."""
+        cache_key = f"user_repos:{username}"
 
-    result: list[dict[str, Any]] = []
-    page = 1
-    try:
-        while True:
-            response = client.get(
-                f"/repos/{repo}/pulls",
-                params={
-                    "state": "closed",
-                    "per_page": 100,
-                    "page": page,
-                    "sort": "updated",
-                    "direction": "desc",
-                },
-            )
-            response.raise_for_status()
-            prs: list[dict[str, Any]] = response.json()
-            if not prs:
-                break
+        def fetch() -> list[str]:
+            repos_iter = self._paginate(f"/users/{username}/repos", {"type": "owner"})
+            return [repo["full_name"] for repo in repos_iter]
 
-            for pr in prs:
+        return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
+
+    def get_merged_prs(
+        self,
+        repo: str,
+        username: str,
+        since: datetime,
+    ) -> list[dict[str, Any]]:
+        """Get merged PRs for a repo by a user since a date."""
+        since_str = since.strftime("%Y-%m-%d")
+        cache_key = f"merged_prs:{repo}:{username}:{since_str}"
+
+        def fetch() -> list[dict[str, Any]]:
+            result = []
+            params = {"state": "closed", "sort": "updated", "direction": "desc"}
+            for pr in self._paginate(f"/repos/{repo}/pulls", params):
                 if pr["merged_at"] is None:
                     continue
                 merged_at = datetime.fromisoformat(pr["merged_at"])
@@ -153,261 +187,269 @@ def get_merged_prs(  # noqa: C901
                     continue
                 if pr["user"]["login"] == username:
                     result.append(pr)
+            return result
 
-            if prs:
-                oldest = prs[-1]
-                if oldest["updated_at"]:
-                    oldest_date = datetime.fromisoformat(oldest["updated_at"])
-                    if oldest_date.replace(tzinfo=None) < since:
-                        break
-            page += 1
-    except (httpx.HTTPStatusError, httpx.TimeoutException):
-        # Rate limited or timeout - return what we have
-        pass
+        return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
 
-    cache.set(cache_key, result, expire=TTL_MUTABLE)
-    return result
+    def get_default_branch(self, repo: str) -> str | None:
+        """Get the default branch for a repository."""
+        cache_key = f"default_branch:{repo}"
+
+        def fetch() -> str:
+            response = self.client.get(f"/repos/{repo}")
+            response.raise_for_status()
+            branch: str = response.json()["default_branch"]
+            return branch
+
+        result: str | None = self._cached_fetch(cache_key, fetch, TTL_MUTABLE)
+        return result
+
+    def get_branch_commits(
+        self,
+        repo: str,
+        branch: str,
+        username: str,
+        since: datetime,
+        until: datetime,
+    ) -> list[dict[str, Any]]:
+        """Get commits on a branch by a user within a date range."""
+        since_str = since.strftime("%Y-%m-%d")
+        until_str = until.strftime("%Y-%m-%d")
+        cache_key = f"branch_commits:{repo}:{branch}:{username}:{since_str}:{until_str}"
+
+        def fetch() -> list[dict[str, Any]]:
+            params = {
+                "sha": branch,
+                "author": username,
+                "since": since.isoformat(),
+                "until": until.isoformat(),
+            }
+            return list(self._paginate(f"/repos/{repo}/commits", params))
+
+        return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
+
+    def get_pr_commits(self, repo: str, pr_number: int) -> list[str]:
+        """Get all commit SHAs in a PR."""
+        cache_key = f"pr_commits:{repo}:{pr_number}"
+
+        def fetch() -> list[str]:
+            return [c["sha"] for c in self._paginate(f"/repos/{repo}/pulls/{pr_number}/commits")]
+
+        return self._cached_fetch(cache_key, fetch, TTL_IMMUTABLE) or []
+
+    def get_commit_stats(self, repo: str, sha: str) -> tuple[int, int, dict[str, FileStats]]:
+        """Get additions and deletions for a single commit."""
+        cache_key = f"commit_stats:{repo}:{sha}"
+
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            total_add, total_del, ext_data = cached
+            by_ext = {ext: FileStats.from_tuple(t) for ext, t in ext_data.items()}
+            return total_add, total_del, by_ext
+
+        try:
+            response = self.client.get(f"/repos/{repo}/commits/{sha}")
+            response.raise_for_status()
+        except (httpx.HTTPStatusError, httpx.TimeoutException):
+            return 0, 0, {}
+
+        return self._parse_file_stats(response.json().get("files", []), cache_key)
+
+    def get_pr_stats_per_commit(
+        self, repo: str, pr_number: int
+    ) -> tuple[int, int, dict[str, FileStats]]:
+        """Get total additions/deletions across all commits in a PR."""
+        cache_key = f"pr_stats_per_commit:{repo}:{pr_number}"
+
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            total_add, total_del, ext_data = cached
+            by_ext = {ext: FileStats.from_tuple(t) for ext, t in ext_data.items()}
+            return total_add, total_del, by_ext
+
+        by_extension: dict[str, FileStats] = defaultdict(FileStats)
+        total_additions = 0
+        total_deletions = 0
+
+        for sha in self.get_pr_commits(repo, pr_number):
+            add, del_, ext_stats = self.get_commit_stats(repo, sha)
+            total_additions += add
+            total_deletions += del_
+            for ext, stats in ext_stats.items():
+                by_extension[ext].additions += stats.additions
+                by_extension[ext].deletions += stats.deletions
+
+        ext_data = {ext: stats.to_tuple() for ext, stats in by_extension.items()}
+        self.cache.set(cache_key, (total_additions, total_deletions, ext_data))
+        return total_additions, total_deletions, dict(by_extension)
+
+    def get_pr_stats_net(self, repo: str, pr_number: int) -> tuple[int, int, dict[str, FileStats]]:
+        """Get net additions/deletions for a PR (final diff only)."""
+        cache_key = f"pr_stats_net:{repo}:{pr_number}"
+
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            total_add, total_del, ext_data = cached
+            by_ext = {ext: FileStats.from_tuple(t) for ext, t in ext_data.items()}
+            return total_add, total_del, by_ext
+
+        # Fetch PR files
+        files_cache_key = f"pr_files:{repo}:{pr_number}"
+        files = self.cache.get(files_cache_key)
+        if files is None:
+            try:
+                files = list(self._paginate(f"/repos/{repo}/pulls/{pr_number}/files"))
+            except (httpx.HTTPStatusError, httpx.TimeoutException):
+                files = []
+            self.cache.set(files_cache_key, files)
+
+        return self._parse_file_stats(files, cache_key)
+
+    def _parse_file_stats(
+        self,
+        files: list[dict[str, Any]],
+        cache_key: str,
+    ) -> tuple[int, int, dict[str, FileStats]]:
+        """Parse file stats from API response and cache result."""
+        by_extension: dict[str, FileStats] = defaultdict(FileStats)
+        total_additions = 0
+        total_deletions = 0
+
+        for file in files:
+            ext = _get_file_extension(file["filename"])
+            additions = file.get("additions", 0)
+            deletions = file.get("deletions", 0)
+            by_extension[ext].additions += additions
+            by_extension[ext].deletions += deletions
+            total_additions += additions
+            total_deletions += deletions
+
+        ext_data = {ext: stats.to_tuple() for ext, stats in by_extension.items()}
+        self.cache.set(cache_key, (total_additions, total_deletions, ext_data))
+        return total_additions, total_deletions, dict(by_extension)
 
 
-def get_file_extension(filename: str) -> str:
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+def _get_file_extension(filename: str) -> str:
     """Extract file extension from filename."""
     path = Path(filename)
     return path.suffix.lower() if path.suffix else path.name.lower()
 
 
-def get_default_branch(
-    client: httpx.Client,
-    cache: diskcache.Cache,
+def _get_github_token() -> str:
+    """Get GitHub token from gh CLI."""
+    result = subprocess.run(
+        ["gh", "auth", "token"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _get_cache(no_cache: bool) -> diskcache.Cache:  # noqa: FBT001
+    """Get disk cache or in-memory cache."""
+    if no_cache:
+        return diskcache.Cache(":memory:")
+    return diskcache.Cache(str(CACHE_DIR))
+
+
+# =============================================================================
+# Processing Functions
+# =============================================================================
+
+
+def _process_pr(  # noqa: PLR0913
+    gh: GitHubClient,
     repo: str,
-) -> str:
-    """Get the default branch for a repository."""
-    cache_key = f"default_branch:{repo}"
+    pr: dict[str, Any],
+    per_commit: bool,  # noqa: FBT001
+    aggregator: StatsAggregator,
+    include_direct_commits: bool,  # noqa: FBT001
+) -> None:
+    """Process a single PR and update aggregator."""
+    get_stats = gh.get_pr_stats_per_commit if per_commit else gh.get_pr_stats_net
+    cache_prefix = "pr_stats_per_commit" if per_commit else "pr_stats_net"
 
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached  # type: ignore[no-any-return]
+    cache_key = f"{cache_prefix}:{repo}:{pr['number']}"
+    was_cached = cache_key in gh.cache
 
-    response = client.get(f"/repos/{repo}")
-    response.raise_for_status()
-    branch = response.json()["default_branch"]
+    additions, deletions, by_ext = get_stats(repo, pr["number"])
 
-    cache.set(cache_key, branch, expire=TTL_MUTABLE)
-    return branch  # type: ignore[no-any-return]
+    if was_cached:
+        aggregator.cache_hits += 1
+
+    if include_direct_commits:
+        pr_commits = gh.get_pr_commits(repo, pr["number"])
+        aggregator.pr_commit_shas.update(pr_commits)
+
+    aggregator.add_pr(
+        PRStats(
+            repo=repo,
+            pr_number=pr["number"],
+            title=pr["title"][:50],
+            additions=additions,
+            deletions=deletions,
+            merged_at=pr["merged_at"][:10],
+            by_extension=by_ext,
+        )
+    )
 
 
-def get_branch_commits(  # noqa: PLR0913
-    client: httpx.Client,
-    cache: diskcache.Cache,
+def _process_direct_commits(  # noqa: PLR0913
+    gh: GitHubClient,
     repo: str,
-    branch: str,
     username: str,
     since: datetime,
     until: datetime,
-) -> list[dict[str, Any]]:
-    """Get all commits on a branch by a user within a date range (cached with TTL)."""
-    since_str = since.strftime("%Y-%m-%d")
-    until_str = until.strftime("%Y-%m-%d")
-    cache_key = f"branch_commits:{repo}:{branch}:{username}:{since_str}:{until_str}"
+    aggregator: StatsAggregator,
+) -> None:
+    """Process direct commits for a repo and update aggregator."""
+    default_branch = gh.get_default_branch(repo)
+    if not default_branch:
+        return
 
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached  # type: ignore[no-any-return]
+    branch_commits = gh.get_branch_commits(repo, default_branch, username, since, until)
 
-    result: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        response = client.get(
-            f"/repos/{repo}/commits",
-            params={
-                "sha": branch,
-                "author": username,
-                "since": since.isoformat(),
-                "until": until.isoformat(),
-                "per_page": 100,
-                "page": page,
-            },
-        )
-        response.raise_for_status()
-        commits: list[dict[str, Any]] = response.json()
-        if not commits:
-            break
-        result.extend(commits)
-        page += 1
+    for commit in branch_commits:
+        sha = commit["sha"]
+        if sha in aggregator.pr_commit_shas:
+            continue
 
-    cache.set(cache_key, result, expire=TTL_MUTABLE)
-    return result
+        cache_key = f"commit_stats:{repo}:{sha}"
+        was_cached = cache_key in gh.cache
 
+        additions, deletions, by_ext = gh.get_commit_stats(repo, sha)
 
-def get_pr_commits(
-    client: httpx.Client,
-    cache: diskcache.Cache,
-    repo: str,
-    pr_number: int,
-) -> list[str]:
-    """Get all commit SHAs in a PR."""
-    cache_key = f"pr_commits:{repo}:{pr_number}"
+        if was_cached:
+            aggregator.cache_hits += 1
 
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached  # type: ignore[no-any-return]
+        commit_date = commit["commit"]["author"]["date"][:10]
+        message = commit["commit"]["message"].split("\n")[0]
 
-    commits: list[str] = []
-    page = 1
-    try:
-        while True:
-            response = client.get(
-                f"/repos/{repo}/pulls/{pr_number}/commits",
-                params={"per_page": 100, "page": page},
+        aggregator.add_commit(
+            CommitStats(
+                repo=repo,
+                sha=sha,
+                message=message[:50],
+                additions=additions,
+                deletions=deletions,
+                committed_at=commit_date,
+                by_extension=by_ext,
             )
-            response.raise_for_status()
-            page_commits: list[dict[str, Any]] = response.json()
-            if not page_commits:
-                break
-            commits.extend(c["sha"] for c in page_commits)
-            page += 1
-    except (httpx.HTTPStatusError, httpx.TimeoutException):
-        # Rate limited or timeout - return what we have
-        pass
-
-    cache.set(cache_key, commits)
-    return commits
+        )
 
 
-def get_commit_stats(
-    client: httpx.Client,
-    cache: diskcache.Cache,
-    repo: str,
-    sha: str,
-) -> tuple[int, int, dict[str, FileStats]]:
-    """Get additions and deletions for a single commit."""
-    cache_key = f"commit_stats:{repo}:{sha}"
-
-    cached = cache.get(cache_key)
-    if cached is not None:
-        total_add, total_del, ext_data = cached
-        cached_by_ext = {ext: FileStats(add, del_) for ext, (add, del_) in ext_data.items()}
-        return total_add, total_del, cached_by_ext
-
-    try:
-        response = client.get(f"/repos/{repo}/commits/{sha}")
-        response.raise_for_status()
-    except (httpx.HTTPStatusError, httpx.TimeoutException):
-        # Rate limited or timeout - return empty stats
-        return 0, 0, {}
-    commit_data = response.json()
-
-    by_extension: dict[str, FileStats] = defaultdict(FileStats)
-    total_additions = 0
-    total_deletions = 0
-
-    for file in commit_data.get("files", []):
-        ext = get_file_extension(file["filename"])
-        additions = file.get("additions", 0)
-        deletions = file.get("deletions", 0)
-        by_extension[ext].additions += additions
-        by_extension[ext].deletions += deletions
-        total_additions += additions
-        total_deletions += deletions
-
-    ext_data = {ext: (stats.additions, stats.deletions) for ext, stats in by_extension.items()}
-    cache.set(cache_key, (total_additions, total_deletions, ext_data))
-
-    return total_additions, total_deletions, dict(by_extension)
+# =============================================================================
+# Display Functions
+# =============================================================================
 
 
-def get_pr_stats_per_commit(
-    client: httpx.Client,
-    cache: diskcache.Cache,
-    repo: str,
-    pr_number: int,
-) -> tuple[int, int, dict[str, FileStats]]:
-    """Get total additions/deletions across all commits in a PR (counts all changes)."""
-    cache_key = f"pr_stats_per_commit:{repo}:{pr_number}"
-
-    cached = cache.get(cache_key)
-    if cached is not None:
-        total_add, total_del, ext_data = cached
-        cached_by_ext = {ext: FileStats(add, del_) for ext, (add, del_) in ext_data.items()}
-        return total_add, total_del, cached_by_ext
-
-    commits = get_pr_commits(client, cache, repo, pr_number)
-
-    by_extension: dict[str, FileStats] = defaultdict(FileStats)
-    total_additions = 0
-    total_deletions = 0
-
-    for sha in commits:
-        add, del_, ext_stats = get_commit_stats(client, cache, repo, sha)
-        total_additions += add
-        total_deletions += del_
-        for ext, stats in ext_stats.items():
-            by_extension[ext].additions += stats.additions
-            by_extension[ext].deletions += stats.deletions
-
-    ext_data = {ext: (stats.additions, stats.deletions) for ext, stats in by_extension.items()}
-    cache.set(cache_key, (total_additions, total_deletions, ext_data))
-
-    return total_additions, total_deletions, dict(by_extension)
-
-
-def get_pr_stats_net(
-    client: httpx.Client,
-    cache: diskcache.Cache,
-    repo: str,
-    pr_number: int,
-) -> tuple[int, int, dict[str, FileStats]]:
-    """Get net additions/deletions for a PR (final diff only)."""
-    cache_key = f"pr_stats_net:{repo}:{pr_number}"
-
-    cached = cache.get(cache_key)
-    if cached is not None:
-        total_add, total_del, ext_data = cached
-        cached_by_ext = {ext: FileStats(add, del_) for ext, (add, del_) in ext_data.items()}
-        return total_add, total_del, cached_by_ext
-
-    # Fetch PR files (final diff)
-    files_cache_key = f"pr_files:{repo}:{pr_number}"
-    files = cache.get(files_cache_key)
-    if files is None:
-        files = []
-        page = 1
-        try:
-            while True:
-                response = client.get(
-                    f"/repos/{repo}/pulls/{pr_number}/files",
-                    params={"per_page": 100, "page": page},
-                )
-                response.raise_for_status()
-                page_files: list[dict[str, Any]] = response.json()
-                if not page_files:
-                    break
-                files.extend(page_files)
-                page += 1
-        except (httpx.HTTPStatusError, httpx.TimeoutException):
-            # Rate limited or timeout - return what we have
-            pass
-        cache.set(files_cache_key, files)
-
-    by_extension: dict[str, FileStats] = defaultdict(FileStats)
-    total_additions = 0
-    total_deletions = 0
-
-    for file in files:
-        ext = get_file_extension(file["filename"])
-        additions = file.get("additions", 0)
-        deletions = file.get("deletions", 0)
-        by_extension[ext].additions += additions
-        by_extension[ext].deletions += deletions
-        total_additions += additions
-        total_deletions += deletions
-
-    ext_data = {ext: (stats.additions, stats.deletions) for ext, stats in by_extension.items()}
-    cache.set(cache_key, (total_additions, total_deletions, ext_data))
-
-    return total_additions, total_deletions, dict(by_extension)
-
-
-def display_pr_table(
+def _display_pr_table(
     all_stats: list[PRStats], username: str, since: str, until: str | None
 ) -> None:
     """Display the PR statistics table."""
@@ -431,8 +473,11 @@ def display_pr_table(
     console.print(table)
 
 
-def display_direct_commits_table(
-    all_commits: list[CommitStats], username: str, since: str, until: str | None
+def _display_direct_commits_table(
+    all_commits: list[CommitStats],
+    username: str,
+    since: str,
+    until: str | None,
 ) -> None:
     """Display the direct commits statistics table."""
     table = Table(title=f"Direct commits by {username} from {since} to {until or 'now'}")
@@ -455,8 +500,8 @@ def display_direct_commits_table(
     console.print(table)
 
 
-def display_extension_table(
-    total_by_extension: dict[str, FileStats],
+def _display_extension_table(
+    by_extension: dict[str, FileStats],
     total_additions: int,
     total_deletions: int,
 ) -> None:
@@ -470,7 +515,7 @@ def display_extension_table(
 
     total_lines = total_additions + total_deletions
     sorted_exts = sorted(
-        total_by_extension.items(),
+        by_extension.items(),
         key=lambda x: x[1].additions + x[1].deletions,
         reverse=True,
     )
@@ -488,38 +533,37 @@ def display_extension_table(
     console.print(ext_table)
 
 
-def display_summary(  # noqa: PLR0913
-    all_stats: list[PRStats],
-    all_commits: list[CommitStats],
-    total_additions: int,
-    total_deletions: int,
-    cache_hits: int,
-    since: str,
-    *,
-    per_commit: bool,
-) -> None:
+def _display_summary(aggregator: StatsAggregator, since: str, *, per_commit: bool) -> None:
     """Display the summary statistics."""
     console.print()
     mode_label = "[dim](per-commit totals)[/dim]" if per_commit else "[dim](net diff)[/dim]"
-    console.print(f"[bold]Total PRs:[/bold] {len(all_stats)} {mode_label}")
-    if all_commits:
-        console.print(f"[bold]Direct commits:[/bold] {len(all_commits)}")
-    console.print(f"[bold green]Total additions:[/bold green] +{total_additions:,}")
-    console.print(f"[bold red]Total deletions:[/bold red] -{total_deletions:,}")
-    console.print(f"[bold]Total lines changed:[/bold] {total_additions + total_deletions:,}")
+    console.print(f"[bold]Total PRs:[/bold] {len(aggregator.prs)} {mode_label}")
 
-    if cache_hits > 0:
-        console.print(f"[dim]Cache hits: {cache_hits}[/dim]")
+    if aggregator.direct_commits:
+        console.print(f"[bold]Direct commits:[/bold] {len(aggregator.direct_commits)}")
 
-    if total_additions >= 1_000_000:  # noqa: PLR2004
+    console.print(f"[bold green]Total additions:[/bold green] +{aggregator.total_additions:,}")
+    console.print(f"[bold red]Total deletions:[/bold red] -{aggregator.total_deletions:,}")
+    total = aggregator.total_additions + aggregator.total_deletions
+    console.print(f"[bold]Total lines changed:[/bold] {total:,}")
+
+    if aggregator.cache_hits > 0:
+        console.print(f"[dim]Cache hits: {aggregator.cache_hits}[/dim]")
+
+    if aggregator.total_additions >= 1_000_000:  # noqa: PLR2004
         console.print(
             f"\n[bold yellow]Congratulations! You've written over a million lines "
             f"of code since {since}![/bold yellow]"
         )
 
 
+# =============================================================================
+# CLI Commands
+# =============================================================================
+
+
 @app.command()
-def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
+def count(  # noqa: PLR0913
     username: str = typer.Argument(..., help="GitHub username"),
     since: str = typer.Option(..., "--since", "-s", help="Start date (YYYY-MM-DD)"),
     until: str | None = typer.Option(None, "--until", "-u", help="End date (YYYY-MM-DD)"),
@@ -556,20 +600,10 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
     since_date = datetime.strptime(since, "%Y-%m-%d")  # noqa: DTZ007
     until_date = datetime.strptime(until, "%Y-%m-%d") if until else datetime.now()  # noqa: DTZ005, DTZ007
 
-    token = get_github_token()
+    token = _get_github_token()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-
-    all_stats: list[PRStats] = []
-    all_direct_commits: list[CommitStats] = []
-    total_additions = 0
-    total_deletions = 0
-    total_by_extension: dict[str, FileStats] = defaultdict(FileStats)
-    cache_hits = 0
-    pr_commit_shas: set[str] = set()  # Track all commits from PRs to filter direct commits
-
-    cache = get_cache() if not no_cache else diskcache.Cache(":memory:")
-    get_stats = get_pr_stats_per_commit if per_commit else get_pr_stats_net
-    cache_prefix = "pr_stats_per_commit" if per_commit else "pr_stats_net"
+    cache = _get_cache(no_cache)
+    aggregator = StatsAggregator()
 
     with (
         httpx.Client(base_url="https://api.github.com", headers=headers, timeout=30.0) as client,
@@ -581,8 +615,10 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
             console=console,
         ) as progress,
     ):
+        gh = GitHubClient(client, cache)
+
         fetch_task = progress.add_task("Fetching repositories...", total=None)
-        repos = get_user_repos(client, cache, username)
+        repos = gh.get_user_repos(username)
         progress.remove_task(fetch_task)
 
         repo_task = progress.add_task("Processing repos", total=len(repos))
@@ -590,114 +626,37 @@ def count(  # noqa: PLR0913, PLR0915, PLR0912, C901
         for repo in repos:
             progress.update(repo_task, description=f"[cyan]{repo}[/cyan]")
 
-            # Process PRs
-            for pr in get_merged_prs(client, cache, repo, username, since_date):
+            for pr in gh.get_merged_prs(repo, username, since_date):
                 merged_at = datetime.fromisoformat(pr["merged_at"])
                 if merged_at.replace(tzinfo=None) > until_date:
                     continue
+                _process_pr(gh, repo, pr, per_commit, aggregator, include_direct_commits)
 
-                cache_key = f"{cache_prefix}:{repo}:{pr['number']}"
-                was_cached = cache_key in cache
-                additions, deletions, by_ext = get_stats(client, cache, repo, pr["number"])
-                if was_cached:
-                    cache_hits += 1
-
-                # Track PR commit SHAs for filtering direct commits later
-                if include_direct_commits:
-                    pr_commits = get_pr_commits(client, cache, repo, pr["number"])
-                    pr_commit_shas.update(pr_commits)
-
-                for ext, ext_stats in by_ext.items():
-                    total_by_extension[ext].additions += ext_stats.additions
-                    total_by_extension[ext].deletions += ext_stats.deletions
-
-                all_stats.append(
-                    PRStats(
-                        repo=repo,
-                        pr_number=pr["number"],
-                        title=pr["title"][:50],
-                        additions=additions,
-                        deletions=deletions,
-                        merged_at=pr["merged_at"][:10],
-                        by_extension=by_ext,
-                    )
-                )
-                total_additions += additions
-                total_deletions += deletions
-
-            # Process direct commits (not from PRs)
             if include_direct_commits:
-                try:
-                    default_branch = get_default_branch(client, cache, repo)
-                    branch_commits = get_branch_commits(
-                        client, cache, repo, default_branch, username, since_date, until_date
-                    )
-
-                    for commit in branch_commits:
-                        sha = commit["sha"]
-                        # Skip if this commit came from a PR (local check, no API call)
-                        if sha in pr_commit_shas:
-                            continue
-
-                        # This is a direct commit
-                        cache_key = f"commit_stats:{repo}:{sha}"
-                        was_cached = cache_key in cache
-                        additions, deletions, by_ext = get_commit_stats(client, cache, repo, sha)
-                        if was_cached:
-                            cache_hits += 1
-
-                        for ext, ext_stats in by_ext.items():
-                            total_by_extension[ext].additions += ext_stats.additions
-                            total_by_extension[ext].deletions += ext_stats.deletions
-
-                        commit_date = commit["commit"]["author"]["date"][:10]
-                        message = commit["commit"]["message"].split("\n")[0]
-
-                        all_direct_commits.append(
-                            CommitStats(
-                                repo=repo,
-                                sha=sha,
-                                message=message[:50],
-                                additions=additions,
-                                deletions=deletions,
-                                committed_at=commit_date,
-                                by_extension=by_ext,
-                            )
-                        )
-                        total_additions += additions
-                        total_deletions += deletions
-                except (httpx.HTTPStatusError, httpx.TimeoutException):
-                    # Some repos might not have commits or access issues, or timeout
-                    pass
+                _process_direct_commits(gh, repo, username, since_date, until_date, aggregator)
 
             progress.advance(repo_task)
 
-    if all_stats:
-        display_pr_table(all_stats, username, since, until)
+    if aggregator.prs:
+        _display_pr_table(aggregator.prs, username, since, until)
 
-    if all_direct_commits:
+    if aggregator.direct_commits:
         console.print()
-        display_direct_commits_table(all_direct_commits, username, since, until)
+        _display_direct_commits_table(aggregator.direct_commits, username, since, until)
 
-    if show_extensions and total_by_extension:
+    if show_extensions and aggregator.by_extension:
         console.print()
-        display_extension_table(total_by_extension, total_additions, total_deletions)
+        _display_extension_table(
+            aggregator.by_extension, aggregator.total_additions, aggregator.total_deletions
+        )
 
-    display_summary(
-        all_stats,
-        all_direct_commits,
-        total_additions,
-        total_deletions,
-        cache_hits,
-        since,
-        per_commit=per_commit,
-    )
+    _display_summary(aggregator, since, per_commit=per_commit)
 
 
 @app.command()
 def clear_cache() -> None:
     """Clear the disk cache."""
-    cache = get_cache()
+    cache = diskcache.Cache(str(CACHE_DIR))
     cache.clear()
     console.print("[green]Cache cleared![/green]")
 
