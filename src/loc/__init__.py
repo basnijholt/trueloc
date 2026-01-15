@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -120,6 +121,60 @@ class GitHubClient:
         self.client = client
         self.cache = cache
 
+    def _wait_for_rate_limit(self, response: httpx.Response) -> None:
+        """Wait for rate limit to reset, showing countdown progress bar."""
+        reset_timestamp = int(response.headers.get("X-RateLimit-Reset", 0))
+        retry_after = int(response.headers.get("Retry-After", 0))
+
+        # Calculate wait time
+        if retry_after > 0:
+            wait_seconds = retry_after
+        elif reset_timestamp > 0:
+            wait_seconds = max(0, reset_timestamp - int(time.time()) + 1)
+        else:
+            wait_seconds = 60  # Default fallback
+
+        if wait_seconds <= 0:
+            return
+
+        console.print(f"[yellow]Rate limited. Waiting {wait_seconds}s for reset...[/yellow]")
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Waiting for rate limit reset", total=wait_seconds)
+            for _ in range(wait_seconds):
+                time.sleep(1)
+                progress.advance(task)
+
+    def _request(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        max_retries: int = 3,
+    ) -> httpx.Response:
+        """Make a request with rate limit handling."""
+        for _attempt in range(max_retries):
+            response = self.client.get(endpoint, params=params)
+
+            # Check for rate limiting (403 Forbidden or 429 Too Many Requests)
+            rate_limit_codes = (403, 429)
+            if response.status_code in rate_limit_codes:
+                remaining = response.headers.get("X-RateLimit-Remaining", "1")
+                if remaining == "0" or response.status_code == rate_limit_codes[1]:
+                    self._wait_for_rate_limit(response)
+                    continue  # Retry after waiting
+
+            response.raise_for_status()
+            return response
+
+        # If we exhausted retries, raise the last error
+        response.raise_for_status()
+        return response  # Never reached, but keeps type checker happy
+
     def _paginate(
         self,
         endpoint: str,
@@ -129,8 +184,7 @@ class GitHubClient:
         params = params or {}
         page = 1
         while True:
-            response = self.client.get(endpoint, params={**params, "per_page": 100, "page": page})
-            response.raise_for_status()
+            response = self._request(endpoint, params={**params, "per_page": 100, "page": page})
             items = response.json()
             if not items:
                 break
@@ -196,8 +250,7 @@ class GitHubClient:
         cache_key = f"default_branch:{repo}"
 
         def fetch() -> str:
-            response = self.client.get(f"/repos/{repo}")
-            response.raise_for_status()
+            response = self._request(f"/repos/{repo}")
             branch: str = response.json()["default_branch"]
             return branch
 
@@ -248,8 +301,7 @@ class GitHubClient:
             return total_add, total_del, by_ext
 
         try:
-            response = self.client.get(f"/repos/{repo}/commits/{sha}")
-            response.raise_for_status()
+            response = self._request(f"/repos/{repo}/commits/{sha}")
         except (httpx.HTTPStatusError, httpx.TimeoutException):
             return 0, 0, {}
 
