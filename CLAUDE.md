@@ -58,5 +58,6 @@ loc clear-cache
 ## TODO
 
 - [x] Add direct commit counting (commits pushed directly to main, not via PR)
+- [x] Add comprehensive test suite with respx mocking (51 tests, 63% coverage)
 - [ ] Handle pagination edge cases for very large repos
 - [ ] Add JSON output option for scripting
