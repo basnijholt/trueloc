@@ -448,20 +448,58 @@ class TestGitHubClientPRCaching:
         assert cached["cached_since"] == since.isoformat()
         assert cached["prs"] == prs
 
-    def test_get_merged_prs_smart_caching(
+    def test_get_merged_prs_caches_on_first_call(
         self, memory_cache: diskcache.Cache, respx_mock: respx.Router
     ) -> None:
-        """Test smart range-aware caching for merged PRs."""
-        # First page with data
+        """Test that first call fetches from API and caches."""
+        route = respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "number": 1,
+                        "merged_at": "2024-01-10T10:00:00Z",
+                        "user": {"login": "testuser"},
+                    },
+                ],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
         respx_mock.get(
             "https://api.github.com/repos/user/repo/pulls",
-            params={
-                "state": "closed",
-                "sort": "updated",
-                "direction": "desc",
-                "per_page": "100",
-                "page": "1",
-            },
+            params__contains={"state": "closed", "page": "2"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+            since = datetime(2024, 1, 5)
+            prs = gh.get_merged_prs("user/repo", "testuser", since)
+
+            assert len(prs) == 1
+            assert route.call_count == 1
+
+            # Verify cache was populated
+            cache_key = "merged_prs_v2:user/repo:testuser"
+            cached = memory_cache.get(cache_key)
+            assert cached is not None
+            assert cached["cached_since"] == since.isoformat()
+
+    def test_get_merged_prs_filters_locally_for_narrower_range(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """Test that narrower date range uses cache without API call."""
+        route = respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "1"},
         ).mock(
             return_value=httpx.Response(
                 200,
@@ -480,16 +518,9 @@ class TestGitHubClientPRCaching:
                 headers={"X-RateLimit-Remaining": "5000"},
             )
         )
-        # Second page empty
         respx_mock.get(
             "https://api.github.com/repos/user/repo/pulls",
-            params={
-                "state": "closed",
-                "sort": "updated",
-                "direction": "desc",
-                "per_page": "100",
-                "page": "2",
-            },
+            params__contains={"state": "closed", "page": "2"},
         ).mock(
             return_value=httpx.Response(
                 200,
@@ -501,16 +532,82 @@ class TestGitHubClientPRCaching:
         with httpx.Client(base_url="https://api.github.com") as client:
             gh = GitHubClient(client, memory_cache)
 
-            # First call - fetches from API
-            since_7d = datetime(2024, 1, 5)
-            prs1 = gh.get_merged_prs("user/repo", "testuser", since_7d)
+            # First call with wide range - fetches from API
+            since_wide = datetime(2024, 1, 5)
+            prs1 = gh.get_merged_prs("user/repo", "testuser", since_wide)
             assert len(prs1) == 2
+            assert route.call_count == 1
 
-            # Second call with shorter range - should filter locally (no API call)
-            since_5d = datetime(2024, 1, 9)
-            prs2 = gh.get_merged_prs("user/repo", "testuser", since_5d)
+            # Second call with narrower range - should NOT hit API
+            since_narrow = datetime(2024, 1, 9)
+            prs2 = gh.get_merged_prs("user/repo", "testuser", since_narrow)
             assert len(prs2) == 1
             assert prs2[0]["number"] == 1
+            # API should NOT have been called again
+            assert route.call_count == 1
+
+    def test_get_merged_prs_fetches_gap_for_wider_range(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """Test that requesting older data fetches only the gap."""
+        # Pre-populate cache with data from Jan 8 onwards
+        cache_key = "merged_prs_v2:user/repo:testuser"
+        memory_cache.set(
+            cache_key,
+            {
+                "cached_since": "2024-01-08T00:00:00",
+                "prs": [
+                    {
+                        "number": 1,
+                        "merged_at": "2024-01-10T10:00:00Z",
+                        "user": {"login": "testuser"},
+                    },
+                ],
+            },
+        )
+
+        # Mock the gap fetch (Jan 5 to Jan 8)
+        gap_route = respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "number": 2,
+                        "merged_at": "2024-01-06T10:00:00Z",
+                        "user": {"login": "testuser"},
+                    },
+                ],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "2"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+
+            # Request older data (Jan 5) - should fetch gap and merge
+            since_older = datetime(2024, 1, 5)
+            prs = gh.get_merged_prs("user/repo", "testuser", since_older)
+
+            # Should have both PRs now
+            assert len(prs) == 2
+            assert gap_route.call_count == 1
+
+            # Cache should be updated with new watermark
+            cached = memory_cache.get(cache_key)
+            assert cached["cached_since"] == since_older.isoformat()
 
 
 class TestGitHubClientRequest:
