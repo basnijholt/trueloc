@@ -875,6 +875,7 @@ def _output_json(
         "summary": {
             "total_prs": len(aggregator.prs),
             "total_direct_commits": len(aggregator.direct_commits),
+            "total_commits": len(aggregator.prs) + len(aggregator.direct_commits),
             "total_additions": aggregator.total_additions,
             "total_deletions": aggregator.total_deletions,
             "total_lines": aggregator.total_additions + aggregator.total_deletions,
@@ -1022,6 +1023,309 @@ def clear_cache() -> None:
     cache = diskcache.Cache(str(CACHE_DIR))
     cache.clear()
     console.print("[green]Cache cleared![/green]")
+
+
+# =============================================================================
+# Local Git Repository Counting
+# =============================================================================
+
+
+@dataclass
+class LocalCommitStats:
+    """Statistics for a local git commit."""
+
+    sha: str
+    message: str
+    additions: int
+    deletions: int
+    committed_at: str
+    by_extension: dict[str, FileStats] = field(default_factory=dict)
+
+
+def _run_git(repo_path: Path, *args: str) -> str:
+    """Run a git command in the specified repository."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), *args],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def _get_local_commits(
+    repo_path: Path,
+    author: str,
+    since: datetime,
+    until: datetime,
+    *,
+    no_merges: bool = False,
+) -> list[dict[str, str]]:
+    """Get commits from local git repository by author in date range.
+
+    Returns list of dicts with 'sha', 'date', 'message'.
+    """
+    since_str = since.strftime("%Y-%m-%d")
+    until_str = until.strftime("%Y-%m-%d")
+
+    # Format: sha|date|message (first line only)
+    log_format = "%H|%aI|%s"
+    args = [
+        "log",
+        f"--author={author}",
+        f"--since={since_str}",
+        f"--until={until_str}",
+        f"--format={log_format}",
+    ]
+    if no_merges:
+        args.append("--no-merges")
+    output = _run_git(repo_path, *args)
+
+    commits = []
+    for line in output.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("|", 2)
+        if len(parts) == 3:  # noqa: PLR2004
+            commits.append({
+                "sha": parts[0],
+                "date": parts[1][:10],  # Just the date part
+                "message": parts[2],
+            })
+    return commits
+
+
+def _get_commit_numstat(repo_path: Path, sha: str) -> tuple[int, int, dict[str, FileStats]]:
+    """Get additions/deletions for a commit using git show --numstat.
+
+    Returns (total_additions, total_deletions, by_extension).
+    """
+    try:
+        output = _run_git(repo_path, "show", "--numstat", "--format=", sha)
+    except subprocess.CalledProcessError:
+        return 0, 0, {}
+
+    by_extension: dict[str, FileStats] = defaultdict(FileStats)
+    total_add = 0
+    total_del = 0
+
+    for line in output.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:  # noqa: PLR2004
+            continue
+
+        add_str, del_str, filename = parts
+        # Binary files show "-" for additions/deletions
+        if add_str == "-" or del_str == "-":
+            continue
+
+        additions = int(add_str)
+        deletions = int(del_str)
+        ext = _get_file_extension(filename)
+
+        total_add += additions
+        total_del += deletions
+        by_extension[ext].additions += additions
+        by_extension[ext].deletions += deletions
+
+    return total_add, total_del, dict(by_extension)
+
+
+def _display_local_commits_table(
+    commits: list[LocalCommitStats],
+    repo_name: str,
+    author: str,
+    since: str,
+    until: str | None,
+) -> None:
+    """Display the local commits statistics table."""
+    table = Table(title=f"Commits by {author} in {repo_name} from {since} to {until or 'now'}")
+    table.add_column("SHA", style="magenta")
+    table.add_column("Message", style="white")
+    table.add_column("Additions", style="green", justify="right")
+    table.add_column("Deletions", style="red", justify="right")
+    table.add_column("Date", style="blue")
+
+    for commit in sorted(commits, key=lambda x: x.committed_at, reverse=True):
+        table.add_row(
+            commit.sha[:7],
+            commit.message[:60],
+            f"+{commit.additions:,}",
+            f"-{commit.deletions:,}",
+            commit.committed_at,
+        )
+    console.print(table)
+
+
+def _output_local_json(
+    commits: list[LocalCommitStats],
+    by_extension: dict[str, FileStats],
+    total_add: int,
+    total_del: int,
+    repo_name: str,
+    author: str,
+    since: str,
+    until: str | None,
+) -> None:
+    """Output local repo results as JSON to stdout."""
+
+    def ext_to_dict(by_ext: dict[str, FileStats]) -> dict[str, dict[str, int]]:
+        return {ext: asdict(stats) for ext, stats in by_ext.items()}
+
+    output = {
+        "repository": repo_name,
+        "username": author,
+        "since": since,
+        "until": until,
+        "commits": [
+            {
+                "sha": c.sha,
+                "message": c.message,
+                "committed_at": c.committed_at,
+                "additions": c.additions,
+                "deletions": c.deletions,
+                "by_extension": ext_to_dict(c.by_extension),
+            }
+            for c in commits
+        ],
+        "summary": {
+            "total_commits": len(commits),
+            "total_additions": total_add,
+            "total_deletions": total_del,
+            "total_lines": total_add + total_del,
+            "by_extension": ext_to_dict(by_extension),
+        },
+    }
+    json.dump(output, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+@app.command("count-local")
+def count_local(
+    repo_path: str = typer.Argument(..., help="Path to local git repository"),
+    author: str = typer.Option(..., "--author", "-a", help="Git author name or email"),
+    since: str = typer.Option(
+        ..., "--since", "-s", help="Start date (e.g., 5d, 2w, 3m, 1y, 'last month', 2024-01-01)"
+    ),
+    until: str | None = typer.Option(
+        None, "--until", "-u", help="End date (e.g., 1d, 'yesterday', 2024-12-31)"
+    ),
+    *,
+    show_extensions: bool = typer.Option(
+        True,  # noqa: FBT003
+        "--extensions/--no-extensions",
+        help="Show breakdown by file extension",
+    ),
+    output_json: bool = typer.Option(
+        False,  # noqa: FBT003
+        "--json",
+        help="Output results as JSON for scripting",
+    ),
+    include_merges: bool = typer.Option(
+        False,  # noqa: FBT003
+        "--include-merges",
+        help="Include merge commits (usually inflates counts by double-counting)",
+    ),
+) -> None:
+    """Count lines of code from a local git repository.
+
+    Uses git log and git show --numstat to count lines per commit.
+    This works for any git repository, including clones from Gitea,
+    and provides per-file extension breakdown.
+
+    Example:
+        trueloc count-local ../my-repo --author "John Doe" --since 1y
+        trueloc count-local . --author john@example.com --since 2024-01-01
+    """
+    path = Path(repo_path).resolve()
+    if not (path / ".git").exists():
+        msg = f"Not a git repository: {path}"
+        raise typer.BadParameter(msg)
+
+    since_date = _parse_date(since)
+    until_date = _parse_date(until) if until else datetime.now()  # noqa: DTZ005
+
+    repo_name = path.name
+
+    # Get commits
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("[cyan]{task.fields[status]}[/cyan]"),
+        console=console,
+        disable=output_json,
+    ) as progress:
+        fetch_task = progress.add_task("Finding commits...", total=None, status="")
+        raw_commits = _get_local_commits(path, author, since_date, until_date, no_merges=not include_merges)
+        progress.remove_task(fetch_task)
+
+        if not raw_commits:
+            if not output_json:
+                console.print(f"[yellow]No commits found for {author} in {repo_name}[/yellow]")
+            return
+
+        # Process each commit
+        commits: list[LocalCommitStats] = []
+        by_extension: dict[str, FileStats] = defaultdict(FileStats)
+        total_additions = 0
+        total_deletions = 0
+
+        commit_task = progress.add_task(
+            f"Processing commits (0/{len(raw_commits)})",
+            total=len(raw_commits),
+            status="",
+        )
+
+        for idx, raw in enumerate(raw_commits, 1):
+            progress.update(
+                commit_task,
+                description=f"Processing commits ({idx}/{len(raw_commits)})",
+                status=raw["sha"][:7],
+            )
+
+            add, del_, ext_stats = _get_commit_numstat(path, raw["sha"])
+
+            commits.append(
+                LocalCommitStats(
+                    sha=raw["sha"],
+                    message=raw["message"][:60],
+                    additions=add,
+                    deletions=del_,
+                    committed_at=raw["date"],
+                    by_extension=ext_stats,
+                )
+            )
+
+            total_additions += add
+            total_deletions += del_
+            for ext, stats in ext_stats.items():
+                by_extension[ext].additions += stats.additions
+                by_extension[ext].deletions += stats.deletions
+
+            progress.advance(commit_task)
+
+    if output_json:
+        _output_local_json(
+            commits, dict(by_extension), total_additions, total_deletions,
+            repo_name, author, since, until
+        )
+    else:
+        _display_local_commits_table(commits, repo_name, author, since, until)
+
+        if show_extensions and by_extension:
+            console.print()
+            _display_extension_table(dict(by_extension), total_additions, total_deletions)
+
+        console.print()
+        console.print(f"[bold]Total commits:[/bold] {len(commits)}")
+        console.print(f"[bold green]Total additions:[/bold green] +{total_additions:,}")
+        console.print(f"[bold red]Total deletions:[/bold red] -{total_deletions:,}")
+        total = total_additions + total_deletions
+        console.print(f"[bold]Total lines changed:[/bold] {total:,}")
 
 
 if __name__ == "__main__":
