@@ -815,6 +815,209 @@ class TestGitHubClientBranchCommits:
         assert len(commits) == 1
         assert commits[0]["sha"] == "abc123"
 
+    def test_get_branch_commits_filters_locally_for_narrower_range(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """Test that narrower date range uses cache without API call."""
+        since_wide = datetime(2024, 1, 1)
+        until = datetime(2024, 1, 31)
+
+        route = respx_mock.get(
+            "https://api.github.com/repos/user/repo/commits",
+            params={
+                "sha": "main",
+                "author": "testuser",
+                "since": since_wide.isoformat(),
+                "until": until.isoformat(),
+                "per_page": "100",
+                "page": "1",
+            },
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"sha": "abc123", "commit": {"author": {"date": "2024-01-20T10:00:00Z"}}},
+                    {"sha": "def456", "commit": {"author": {"date": "2024-01-10T10:00:00Z"}}},
+                ],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/commits",
+            params={
+                "sha": "main",
+                "author": "testuser",
+                "since": since_wide.isoformat(),
+                "until": until.isoformat(),
+                "per_page": "100",
+                "page": "2",
+            },
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+
+            # First call with wide range - fetches from API
+            commits1 = gh.get_branch_commits("user/repo", "main", "testuser", since_wide, until)
+            assert len(commits1) == 2
+            assert route.call_count == 1
+
+            # Second call with narrower range - should NOT hit API
+            since_narrow = datetime(2024, 1, 15)
+            commits2 = gh.get_branch_commits("user/repo", "main", "testuser", since_narrow, until)
+            assert len(commits2) == 1
+            assert commits2[0]["sha"] == "abc123"
+            # API should NOT have been called again
+            assert route.call_count == 1
+
+    def test_get_branch_commits_fetches_gap_for_older_range(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """Test that requesting older data fetches only the gap."""
+        # Pre-populate cache with data from Jan 10 to Jan 31
+        cache_key = "branch_commits_v2:user/repo:main:testuser"
+        memory_cache.set(
+            cache_key,
+            {
+                "cached_since": "2024-01-10T00:00:00",
+                "cached_until": "2024-01-31T00:00:00",
+                "commits": [
+                    {"sha": "abc123", "commit": {"author": {"date": "2024-01-15T10:00:00Z"}}},
+                ],
+            },
+        )
+
+        # Mock the gap fetch (Jan 1 to Jan 10)
+        gap_route = respx_mock.get(
+            "https://api.github.com/repos/user/repo/commits",
+            params={
+                "sha": "main",
+                "author": "testuser",
+                "since": "2024-01-01T00:00:00",
+                "until": "2024-01-10T00:00:00",
+                "per_page": "100",
+                "page": "1",
+            },
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"sha": "older123", "commit": {"author": {"date": "2024-01-05T10:00:00Z"}}},
+                ],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/commits",
+            params={
+                "sha": "main",
+                "author": "testuser",
+                "since": "2024-01-01T00:00:00",
+                "until": "2024-01-10T00:00:00",
+                "per_page": "100",
+                "page": "2",
+            },
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+
+            # Request older data (Jan 1) - should fetch gap and merge
+            since_older = datetime(2024, 1, 1)
+            until = datetime(2024, 1, 31)
+            commits = gh.get_branch_commits("user/repo", "main", "testuser", since_older, until)
+
+            # Should have both commits now
+            assert len(commits) == 2
+            assert gap_route.call_count == 1
+
+            # Cache should be updated with new watermark
+            cached = memory_cache.get(cache_key)
+            assert cached["cached_since"] == since_older.isoformat()
+
+    def test_get_branch_commits_fetches_gap_for_newer_range(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """Test that requesting newer data fetches only the gap."""
+        # Pre-populate cache with data from Jan 1 to Jan 20
+        cache_key = "branch_commits_v2:user/repo:main:testuser"
+        memory_cache.set(
+            cache_key,
+            {
+                "cached_since": "2024-01-01T00:00:00",
+                "cached_until": "2024-01-20T00:00:00",
+                "commits": [
+                    {"sha": "abc123", "commit": {"author": {"date": "2024-01-15T10:00:00Z"}}},
+                ],
+            },
+        )
+
+        # Mock the gap fetch (Jan 20 to Jan 31)
+        gap_route = respx_mock.get(
+            "https://api.github.com/repos/user/repo/commits",
+            params={
+                "sha": "main",
+                "author": "testuser",
+                "since": "2024-01-20T00:00:00",
+                "until": "2024-01-31T00:00:00",
+                "per_page": "100",
+                "page": "1",
+            },
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"sha": "newer123", "commit": {"author": {"date": "2024-01-25T10:00:00Z"}}},
+                ],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/commits",
+            params={
+                "sha": "main",
+                "author": "testuser",
+                "since": "2024-01-20T00:00:00",
+                "until": "2024-01-31T00:00:00",
+                "per_page": "100",
+                "page": "2",
+            },
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+
+            # Request newer data (to Jan 31) - should fetch gap and merge
+            since = datetime(2024, 1, 1)
+            until_newer = datetime(2024, 1, 31)
+            commits = gh.get_branch_commits("user/repo", "main", "testuser", since, until_newer)
+
+            # Should have both commits now
+            assert len(commits) == 2
+            assert gap_route.call_count == 1
+
+            # Cache should be updated with new watermark
+            cached = memory_cache.get(cache_key)
+            assert cached["cached_until"] == until_newer.isoformat()
+
     def test_get_pr_commits(self, memory_cache: diskcache.Cache, respx_mock: respx.Router) -> None:
         """Test fetching PR commits."""
         # First page

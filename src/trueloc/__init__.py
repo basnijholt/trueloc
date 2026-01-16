@@ -331,6 +331,56 @@ class GitHubClient:
         result: str | None = self._cached_fetch(cache_key, fetch, TTL_MUTABLE)
         return result
 
+    def _fetch_commits_in_range(
+        self,
+        repo: str,
+        branch: str,
+        username: str,
+        since: datetime,
+        until: datetime,
+    ) -> list[dict[str, Any]]:
+        """Fetch commits in a date range from the API."""
+        params = {
+            "sha": branch,
+            "author": username,
+            "since": since.isoformat(),
+            "until": until.isoformat(),
+        }
+        return list(self._paginate(f"/repos/{repo}/commits", params))
+
+    def _filter_commits_in_range(
+        self,
+        commits: list[dict[str, Any]],
+        since: datetime,
+        until: datetime,
+    ) -> list[dict[str, Any]]:
+        """Filter commits to only those within the given date range."""
+        result = []
+        for commit in commits:
+            date_str = commit["commit"]["author"]["date"]
+            commit_date = datetime.fromisoformat(date_str).replace(tzinfo=None)
+            if since <= commit_date <= until:
+                result.append(commit)
+        return result
+
+    def _save_commits_cache(
+        self,
+        cache_key: str,
+        since: datetime,
+        until: datetime,
+        commits: list[dict[str, Any]],
+    ) -> None:
+        """Save commits to cache with watermark dates."""
+        self.cache.set(
+            cache_key,
+            {
+                "cached_since": since.isoformat(),
+                "cached_until": until.isoformat(),
+                "commits": commits,
+            },
+            expire=TTL_MUTABLE,
+        )
+
     def get_branch_commits(
         self,
         repo: str,
@@ -339,21 +389,48 @@ class GitHubClient:
         since: datetime,
         until: datetime,
     ) -> list[dict[str, Any]]:
-        """Get commits on a branch by a user within a date range."""
-        since_str = since.strftime("%Y-%m-%d")
-        until_str = until.strftime("%Y-%m-%d")
-        cache_key = f"branch_commits:{repo}:{branch}:{username}:{since_str}:{until_str}"
+        """Get commits on a branch by a user within a date range.
 
-        def fetch() -> list[dict[str, Any]]:
-            params = {
-                "sha": branch,
-                "author": username,
-                "since": since.isoformat(),
-                "until": until.isoformat(),
-            }
-            return list(self._paginate(f"/repos/{repo}/commits", params))
+        Uses smart range-aware caching:
+        - If cached range covers requested range, filter locally (instant)
+        - If requesting older/newer data, fetch only the gap and merge
+        """
+        cache_key = f"branch_commits_v2:{repo}:{branch}:{username}"
+        cached = self.cache.get(cache_key)
 
-        return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
+        if cached is None:
+            commits = self._fetch_commits_in_range(repo, branch, username, since, until)
+            self._save_commits_cache(cache_key, since, until, commits)
+            return commits
+
+        cached_since = datetime.fromisoformat(cached["cached_since"])
+        cached_until = datetime.fromisoformat(cached["cached_until"])
+        commits = cached["commits"]
+
+        # Requested range is within cached range - filter locally!
+        if since >= cached_since and until <= cached_until:
+            return self._filter_commits_in_range(commits, since, until)
+
+        # Need to expand the cached range
+        new_since = min(since, cached_since)
+        new_until = max(until, cached_until)
+
+        # Fetch older commits if needed
+        if since < cached_since:
+            older_commits = self._fetch_commits_in_range(
+                repo, branch, username, since, cached_since
+            )
+            commits = older_commits + commits
+
+        # Fetch newer commits if needed
+        if until > cached_until:
+            newer_commits = self._fetch_commits_in_range(
+                repo, branch, username, cached_until, until
+            )
+            commits = commits + newer_commits
+
+        self._save_commits_cache(cache_key, new_since, new_until, commits)
+        return self._filter_commits_in_range(commits, since, until)
 
     def get_pr_commits_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
         """Get all commits in a PR (raw API response, cached forever)."""
