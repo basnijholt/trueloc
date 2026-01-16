@@ -19,9 +19,8 @@ from trueloc import (
     GitHubClient,
     PRStats,
     StatsAggregator,
-    _get_file_extension,
-    _parse_date,
 )
+from trueloc.utils import get_file_extension, parse_date
 
 if TYPE_CHECKING:
     pass
@@ -207,68 +206,68 @@ class TestStatsAggregator:
 
 
 class TestGetFileExtension:
-    """Tests for _get_file_extension helper."""
+    """Tests for get_file_extension helper."""
 
     def test_python_file(self) -> None:
         """Test Python file extension."""
-        assert _get_file_extension("src/main.py") == ".py"
+        assert get_file_extension("src/main.py") == ".py"
 
     def test_javascript_file(self) -> None:
         """Test JavaScript file extension."""
-        assert _get_file_extension("app/index.js") == ".js"
+        assert get_file_extension("app/index.js") == ".js"
 
     def test_no_extension(self) -> None:
         """Test file without extension returns filename."""
-        assert _get_file_extension("Makefile") == "makefile"
-        assert _get_file_extension("Dockerfile") == "dockerfile"
+        assert get_file_extension("Makefile") == "makefile"
+        assert get_file_extension("Dockerfile") == "dockerfile"
 
     def test_hidden_file(self) -> None:
         """Test hidden file."""
-        assert _get_file_extension(".gitignore") == ".gitignore"
+        assert get_file_extension(".gitignore") == ".gitignore"
 
     def test_multiple_dots(self) -> None:
         """Test file with multiple dots."""
-        assert _get_file_extension("app.config.js") == ".js"
+        assert get_file_extension("app.config.js") == ".js"
 
     def test_uppercase_extension(self) -> None:
         """Test uppercase extension is lowercased."""
-        assert _get_file_extension("README.MD") == ".md"
+        assert get_file_extension("README.MD") == ".md"
 
 
 class TestParseDate:
-    """Tests for _parse_date helper."""
+    """Tests for parse_date helper."""
 
     def test_absolute_date(self) -> None:
         """Test parsing absolute date."""
-        result = _parse_date("2024-01-15")
+        result = parse_date("2024-01-15")
         assert result.year == 2024
         assert result.month == 1
         assert result.day == 15
 
     def test_shorthand_days(self) -> None:
         """Test parsing shorthand days."""
-        result = _parse_date("5d")
+        result = parse_date("5d")
         # Should be 5 days ago from now
         assert isinstance(result, datetime)
 
     def test_shorthand_weeks(self) -> None:
         """Test parsing shorthand weeks."""
-        result = _parse_date("2w")
+        result = parse_date("2w")
         assert isinstance(result, datetime)
 
     def test_shorthand_months(self) -> None:
         """Test parsing shorthand months."""
-        result = _parse_date("1m")
+        result = parse_date("1m")
         assert isinstance(result, datetime)
 
     def test_shorthand_years(self) -> None:
         """Test parsing shorthand years."""
-        result = _parse_date("1y")
+        result = parse_date("1y")
         assert isinstance(result, datetime)
 
     def test_natural_language(self) -> None:
         """Test parsing natural language."""
-        result = _parse_date("last week")
+        result = parse_date("last week")
         assert isinstance(result, datetime)
 
     def test_invalid_date_raises(self) -> None:
@@ -276,7 +275,7 @@ class TestParseDate:
         import typer
 
         with pytest.raises(typer.BadParameter):
-            _parse_date("not-a-date-xyz")
+            parse_date("not-a-date-xyz")
 
 
 # =============================================================================
@@ -1134,7 +1133,7 @@ class TestProcessFunctions:
 
     def test_process_pr(self, memory_cache: diskcache.Cache, respx_mock: respx.Router) -> None:
         """Test processing a single PR."""
-        from trueloc import _process_pr
+        from trueloc.cli import _process_pr
 
         # Mock PR files
         respx_mock.get(
@@ -1172,27 +1171,27 @@ class TestHelperFunctions:
 
     def test_get_github_token(self) -> None:
         """Test getting GitHub token."""
-        from trueloc import _get_github_token
+        from trueloc.utils import get_github_token
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout="test_token\n")
-            token = _get_github_token()
+            token = get_github_token()
 
         assert token == "test_token"
 
     def test_get_cache_with_no_cache(self) -> None:
         """Test getting in-memory cache."""
-        from trueloc import _get_cache
+        from trueloc.utils import get_cache
 
-        cache = _get_cache(no_cache=True)
+        cache = get_cache(no_cache=True)
         assert cache is not None
         cache.close()
 
     def test_get_cache_with_disk(self) -> None:
         """Test getting disk cache."""
-        from trueloc import _get_cache
+        from trueloc.utils import get_cache
 
-        cache = _get_cache(no_cache=False)
+        cache = get_cache(no_cache=False)
         assert cache is not None
         cache.close()
 
