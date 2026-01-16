@@ -675,7 +675,6 @@ wheels = [
 
 [[package]]
 name = "trueloc"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "dateparser" },

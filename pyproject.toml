@@ -1,6 +1,6 @@
 [project]
 name = "trueloc"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Count lines of code from GitHub pull requests"
 readme = "README.md"
 authors = [{ name = "Bas Nijholt", email = "bas@nijho.lt" }]
@@ -11,8 +11,14 @@ dependencies = ["typer>=0.15", "httpx>=0.28", "rich>=13", "diskcache>=5", "datep
 trueloc = "trueloc:app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/trueloc/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trueloc"]

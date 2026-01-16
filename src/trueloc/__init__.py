@@ -13,6 +13,12 @@ from trueloc.models import (
 )
 from trueloc.utils import CACHE_DIR, parse_date
 
+try:
+    from trueloc._version import __version__, __version_tuple__
+except ImportError:
+    __version__ = "0.0.0"
+    __version_tuple__ = (0, 0, 0)
+
 __all__ = [
     "CACHE_DIR",
     "CommitStats",
@@ -21,6 +27,8 @@ __all__ = [
     "LocalCommitStats",
     "PRStats",
     "StatsAggregator",
+    "__version__",
+    "__version_tuple__",
     "app",
     "parse_date",
 ]
