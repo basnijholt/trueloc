@@ -15,7 +15,7 @@ A CLI tool to analyze your coding activity via GitHub pull requests and direct c
 - **Per-PR and per-commit breakdown** showing when each contribution was made
 - **File type analysis** revealing which languages you've worked with most
 
-Counts ALL lines touched across commits (not just net diff). For example, a PR where you add 1000 lines, delete them, then add 1 line = +1001 / -1000.
+Counts ALL lines touched across every commit in a PR—even for squash merges where GitHub only shows the final diff. For example, a PR where you add 1000 lines, delete them, then add 1 line shows +1001 / -1000 (not just +1).
 
 ## Installation
 
