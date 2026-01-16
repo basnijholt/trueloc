@@ -9,7 +9,10 @@
 
 <img src="https://raw.githubusercontent.com/basnijholt/trueloc/main/logo.svg" alt="trueloc Logo" align="right" style="width: 150px;" />
 
-A CLI tool to answer: **"How many lines of code have I written since date X?"** — counting ALL lines touched via GitHub pull requests and direct commits (not just net diff). For example, a single PR where you add 1000 lines, delete them, then add 1 line = +1001 / -1000. Additions and deletions are summed separately across all commits.
+A CLI tool to answer: **"How many lines of code have I written since date X?"** — counting ALL lines touched via GitHub pull requests and direct commits (not just net diff).
+
+For example, a single PR where you add 1000 lines, delete them, then add 1 line = +1001 / -1000.
+Additions and deletions are summed separately across all commits.
 
 ## Installation
 
