@@ -9,10 +9,13 @@
 
 <img src="https://raw.githubusercontent.com/basnijholt/trueloc/main/logo.svg" alt="trueloc Logo" align="right" style="width: 150px;" />
 
-A CLI tool to answer: **"How many lines of code have I written since date X?"** — counting ALL lines touched via GitHub pull requests and direct commits (not just net diff).
+A CLI tool to analyze your coding activity via GitHub pull requests and direct commits:
 
-For example, a single PR where you add 1000 lines, delete them, then add 1 line = +1001 / -1000.
-Additions and deletions are summed separately across all commits.
+- **Total lines** written since any date
+- **Per-PR and per-commit breakdown** showing when each contribution was made
+- **File type analysis** revealing which languages you've worked with most
+
+Counts ALL lines touched across commits (not just net diff). For example, a PR where you add 1000 lines, delete them, then add 1 line = +1001 / -1000.
 
 ## Installation
 
