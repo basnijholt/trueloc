@@ -1221,3 +1221,14 @@ class TestCLI:
         result = runner.invoke(app, ["clear-cache"])
         assert result.exit_code == 0
         assert "Cache cleared" in result.stdout
+
+    def test_cache_isolation_fixture(self) -> None:
+        """Verify the global _isolate_cache fixture is working."""
+        from trueloc import cli, utils
+
+        real_cache = Path.home() / ".cache" / "trueloc"
+        # Access cli.CACHE_DIR to verify the fixture patches it (not exported, so ignore mypy)
+        cli_cache = cli.CACHE_DIR  # type: ignore[attr-defined]
+        utils_cache = utils.CACHE_DIR
+        assert real_cache != cli_cache, f"cli.CACHE_DIR not isolated: {cli_cache}"
+        assert real_cache != utils_cache, f"utils.CACHE_DIR not isolated: {utils_cache}"
