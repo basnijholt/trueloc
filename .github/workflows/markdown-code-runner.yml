@@ -33,6 +33,12 @@ jobs:
           uv pip install -e .
 
       - name: Run markdown-code-runner
+        env:
+          TERM: dumb
+          NO_COLOR: 1
+          COLUMNS: 90  # POSIX terminal width for Rich
+          TERMINAL_WIDTH: 90  # Typer MAX_WIDTH for help panels
+          _TYPER_FORCE_DISABLE_TERMINAL: 1  # Prevent Typer forcing terminal mode in CI
         run: uv run markdown-code-runner --verbose README.md
 
       - name: Commit updated README.md
