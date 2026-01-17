@@ -14,12 +14,14 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from trueloc.display import (
-    display_direct_commits_table,
+    display_activity_stats,
     display_extension_table,
     display_local_commits_table,
     display_local_summary,
-    display_pr_table,
+    display_monthly_breakdown,
+    display_repo_breakdown,
     display_summary,
+    display_top_contributions,
     output_json,
     output_local_json,
 )
@@ -118,7 +120,7 @@ def _process_direct_commits(  # noqa: PLR0913
 
 
 @app.command()
-def count(  # noqa: PLR0913, C901
+def count(  # noqa: PLR0913
     username: str = typer.Argument(..., help="GitHub username"),
     since: str = typer.Option(
         ..., "--since", "-s", help="Start date (e.g., 5d, 2w, 3m, 1y, 'last month', 2024-01-01)"
@@ -239,18 +241,21 @@ def count(  # noqa: PLR0913, C901
     if output_json_flag:
         output_json(aggregator, username, since, until, per_commit=per_commit)
     else:
-        if aggregator.prs:
-            display_pr_table(aggregator.prs, username, since, until)
-
-        if aggregator.direct_commits:
+        if aggregator.prs or aggregator.direct_commits:
+            # Show aggregate statistics instead of per-item tables
+            display_monthly_breakdown(aggregator)
             console.print()
-            display_direct_commits_table(aggregator.direct_commits, username, since, until)
-
-        if show_extensions and aggregator.by_extension:
+            display_repo_breakdown(aggregator)
             console.print()
-            display_extension_table(
-                aggregator.by_extension, aggregator.total_additions, aggregator.total_deletions
-            )
+            display_top_contributions(aggregator)
+
+            if show_extensions and aggregator.by_extension:
+                console.print()
+                display_extension_table(
+                    aggregator.by_extension, aggregator.total_additions, aggregator.total_deletions
+                )
+
+            display_activity_stats(aggregator)
 
         display_summary(aggregator, since, per_commit=per_commit)
 
