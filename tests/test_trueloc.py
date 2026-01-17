@@ -1151,6 +1151,22 @@ class TestProcessFunctions:
             params={"per_page": "100", "page": "2"},
         ).mock(return_value=httpx.Response(200, json=[], headers={"X-RateLimit-Remaining": "5000"}))
 
+        # Mock PR commits (for commit count)
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/123/commits",
+            params={"per_page": "100", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[{"sha": "abc123"}, {"sha": "def456"}],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/123/commits",
+            params={"per_page": "100", "page": "2"},
+        ).mock(return_value=httpx.Response(200, json=[], headers={"X-RateLimit-Remaining": "5000"}))
+
         with httpx.Client(base_url="https://api.github.com") as client:
             gh = GitHubClient(client, memory_cache)
             aggregator = StatsAggregator()
@@ -1164,6 +1180,7 @@ class TestProcessFunctions:
         assert len(aggregator.prs) == 1
         assert aggregator.total_additions == 50
         assert aggregator.total_deletions == 25
+        assert aggregator.prs[0].commit_count == 2
 
 
 class TestHelperFunctions:
