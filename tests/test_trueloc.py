@@ -1210,16 +1210,14 @@ class TestCLI:
 
         assert app is not None
 
-    def test_clear_cache_command(self, tmp_path: Path) -> None:
+    def test_clear_cache_command(self) -> None:
         """Test clear-cache command with isolated temp cache."""
         from typer.testing import CliRunner
 
-        import trueloc
         from trueloc import app
 
         runner = CliRunner()
-        # Patch CACHE_DIR to use temp directory so we never touch the real cache
-        with patch.object(trueloc, "CACHE_DIR", tmp_path / "test_cache"):
-            result = runner.invoke(app, ["clear-cache"])
+        # Global _isolate_cache fixture ensures we never touch the real cache
+        result = runner.invoke(app, ["clear-cache"])
         assert result.exit_code == 0
         assert "Cache cleared" in result.stdout

@@ -2,13 +2,32 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 import respx
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cache(tmp_path: Path) -> Generator[None, None, None]:
+    """Prevent tests from using the real cache directory.
+
+    This fixture patches CACHE_DIR in all modules that import it to use a
+    temporary directory, ensuring tests never touch ~/.cache/trueloc/.
+    """
+    test_cache_dir = tmp_path / "test_cache"
+    test_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch("trueloc.utils.CACHE_DIR", test_cache_dir),
+        patch("trueloc.cli.CACHE_DIR", test_cache_dir),
+    ):
+        yield
 
 
 @pytest.fixture(autouse=True)
