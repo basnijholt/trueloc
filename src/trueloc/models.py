@@ -34,6 +34,7 @@ class PRStats:
     deletions: int
     merged_at: str
     by_extension: dict[str, FileStats] = field(default_factory=dict)
+    commit_count: int = 0
 
 
 @dataclass
