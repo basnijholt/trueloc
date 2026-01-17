@@ -178,11 +178,14 @@ class GitHubClient:
         ]
 
     def _save_pr_cache(self, cache_key: str, since: datetime, prs: list[dict[str, Any]]) -> None:
-        """Save PRs to cache with the given watermark date."""
+        """Save PRs to cache with the given watermark date.
+
+        Uses TTL_IMMUTABLE since range-aware caching handles new PRs by fetching gaps.
+        """
         self.cache.set(
             cache_key,
             {"cached_since": since.isoformat(), "prs": prs},
-            expire=TTL_MUTABLE,
+            expire=TTL_IMMUTABLE,
         )
 
     def get_merged_prs(
@@ -269,7 +272,10 @@ class GitHubClient:
         until: datetime,
         commits: list[dict[str, Any]],
     ) -> None:
-        """Save commits to cache with watermark dates."""
+        """Save commits to cache with watermark dates.
+
+        Uses TTL_IMMUTABLE since range-aware caching handles new commits by fetching gaps.
+        """
         self.cache.set(
             cache_key,
             {
@@ -277,7 +283,7 @@ class GitHubClient:
                 "cached_until": until.isoformat(),
                 "commits": commits,
             },
-            expire=TTL_MUTABLE,
+            expire=TTL_IMMUTABLE,
         )
 
     def get_branch_commits(
