@@ -6,7 +6,7 @@ import subprocess
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
-from trueloc.models import FileStats, LocalCommitStats
+from trueloc.models import FileStats
 from trueloc.utils import get_file_extension
 
 if TYPE_CHECKING:
@@ -105,39 +105,3 @@ def get_commit_numstat(repo_path: Path, sha: str) -> tuple[int, int, dict[str, F
         by_extension[ext].deletions += deletions
 
     return total_add, total_del, dict(by_extension)
-
-
-def process_local_commits(
-    repo_path: Path,
-    raw_commits: list[dict[str, str]],
-) -> tuple[list[LocalCommitStats], dict[str, FileStats], int, int]:
-    """Process raw commits and return stats.
-
-    Returns (commits, by_extension, total_additions, total_deletions).
-    """
-    commits: list[LocalCommitStats] = []
-    by_extension: dict[str, FileStats] = defaultdict(FileStats)
-    total_additions = 0
-    total_deletions = 0
-
-    for raw in raw_commits:
-        add, del_, ext_stats = get_commit_numstat(repo_path, raw["sha"])
-
-        commits.append(
-            LocalCommitStats(
-                sha=raw["sha"],
-                message=raw["message"][:60],
-                additions=add,
-                deletions=del_,
-                committed_at=raw["date"],
-                by_extension=ext_stats,
-            )
-        )
-
-        total_additions += add
-        total_deletions += del_
-        for ext, stats in ext_stats.items():
-            by_extension[ext].additions += stats.additions
-            by_extension[ext].deletions += stats.deletions
-
-    return commits, dict(by_extension), total_additions, total_deletions
