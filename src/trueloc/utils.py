@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
 CACHE_DIR = Path.home() / ".cache" / "trueloc"
-TTL_MUTABLE = 86400  # 1 day for mutable data
+TTL_MUTABLE = 604800  # 7 days for mutable data
 TTL_IMMUTABLE = None  # Never expires for immutable data
 RATE_LIMIT_BUFFER = 500  # Proactively pause when remaining requests drop below this
 
