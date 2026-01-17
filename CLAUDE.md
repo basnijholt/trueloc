@@ -1,63 +1,49 @@
-# trueloc - Lines of Code Counter
+# trueloc - Development Notes
 
-A CLI tool to count how many lines of code you've written via GitHub pull requests and direct commits.
+See [README.md](README.md) for user-facing documentation.
 
-## Goal
+## Project Structure
 
-The primary goal is to answer: **"How many lines of code have I written since date X?"**
-
-This tool counts ALL lines touched (not just net diff). Example: a single PR where you add 1000 lines, delete them, then add 1 line = +1001 / -1000 (even though the PR's net diff shows only +1). Additions and deletions are summed separately across all commits.
-
-## How It Works
-
-1. **Fetches all your repositories** from GitHub
-2. **For each merged PR**: Gets all commits in the PR and sums their additions/deletions
-3. **For direct commits**: Gets commits on default branch that aren't from PRs
-4. **Caches aggressively**: Immutable data (commits, merged PRs) cached forever; mutable data (repo list, PR list) cached for 1 day
-
-## Key Features
-
-- **Per-commit counting**: Counts every line touched in every commit (default)
-- **Net diff mode**: Alternative mode that only counts final diff (`--net`)
-- **File extension breakdown**: Shows which languages you've worked with
-- **Disk caching**: Uses diskcache to avoid hammering the GitHub API
-- **Uses `gh` CLI**: Leverages existing GitHub authentication
-
-## Usage
-
-```bash
-# Count lines from PRs since a date
-trueloc count USERNAME --since 2023-01-01
-
-# Count only net diff (not per-commit)
-trueloc count USERNAME --since 2023-01-01 --net
-
-# Clear the cache
-trueloc clear-cache
+```
+src/trueloc/
+├── cli.py       # Typer commands (count, count-local, clear-cache)
+├── display.py   # Rich table formatting and JSON output
+├── github.py    # GitHubClient - API calls with caching
+├── local.py     # Local git repo analysis (git log/show)
+├── models.py    # Pydantic-style dataclasses for stats
+└── utils.py     # Shared utilities (cache, token, date parsing)
 ```
 
-## Architecture
+## Key Implementation Details
 
-- **GitHub API via httpx**: All data fetched from GitHub REST API
-- **Authentication via `gh auth token`**: Uses GitHub CLI's stored credentials
-- **Caching strategy**:
-  - Immutable (forever): commit stats, PR commits, PR files
-  - TTL 1 day: user repos, merged PR lists
-- **Rich output**: Tables and progress spinners via Rich library
+### Caching Strategy
 
-## Tech Stack
+Cache lives at `~/.cache/trueloc/` using diskcache with SQLite backend.
 
-- Python 3.12+
-- Typer (CLI framework)
-- httpx (HTTP client)
-- Rich (terminal output)
-- diskcache (persistent caching)
-- Hatch (build system)
-- Ruff + mypy (linting/typing)
+**Cache key patterns:**
+- `pr_stats_per_commit:{repo}:{pr_number}` - Per-commit PR stats (immutable)
+- `pr_stats_net:{repo}:{pr_number}` - Net diff PR stats (immutable)
+- `commit_stats:{repo}:{sha}` - Individual commit stats (immutable)
+- `merged_prs_v2:{repo}:{author}` - Merged PRs with `cached_since` watermark
+- `branch_commits_v2:{repo}:{branch}:{author}` - Branch commits with range-aware caching
+
+The `v2` keys use range-aware caching: they store a `cached_since` timestamp and only fetch newer data on subsequent calls.
+
+### GitHub API Flow
+
+1. `get_user_repos()` → all repos user has access to
+2. For each repo: `get_merged_prs()` → PRs merged by user since date
+3. For each PR: `get_pr_stats_per_commit()` or `get_pr_stats_net()`
+4. For direct commits: `get_branch_commits()` → `get_commit_stats()` for each
+
+### Testing
+
+Tests use `respx` to mock HTTP calls. The `conftest.py` has two autouse fixtures:
+- `_isolate_cache` - Patches `CACHE_DIR` to temp directory (prevents touching real cache)
+- `_respx_mock` - Sets up respx with `assert_all_mocked=True`
+
+Run tests: `pytest` or `pytest -x` to stop on first failure.
 
 ## TODO
 
-- [x] Add direct commit counting (commits pushed directly to main, not via PR)
-- [x] Add comprehensive test suite with respx mocking (51 tests, 62% coverage)
-- [x] Add JSON output option for scripting (`--json`)
 - [ ] Handle pagination edge cases for very large repos
