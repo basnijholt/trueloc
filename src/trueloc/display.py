@@ -21,6 +21,56 @@ if TYPE_CHECKING:
 
 console = Console()
 
+# Extensions to exclude from "top languages" (config, lock, docs, data files)
+_EXCLUDED_EXTENSIONS: set[str] = {
+    # Config files
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".config",
+    ".env",
+    ".properties",
+    # Lock files
+    ".lock",
+    # Documentation
+    ".md",
+    ".rst",
+    ".txt",
+    ".adoc",
+    # Data/markup
+    ".xml",
+    ".csv",
+    ".html",
+    ".htm",
+    # Images/assets
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".webp",
+    # Other non-code
+    ".gitignore",
+    ".dockerignore",
+    ".editorconfig",
+    ".prettierrc",
+    ".eslintrc",
+    ".map",
+    ".min.js",
+    ".min.css",
+    ".d.ts",
+}
+
+
+def _is_code_extension(ext: str) -> bool:
+    """Check if extension is a programming language (not config/lock/docs)."""
+    return ext.lower() not in _EXCLUDED_EXTENSIONS
+
 
 def _parse_date(date_str: str) -> datetime:
     """Parse ISO date string to datetime."""
@@ -72,6 +122,70 @@ def display_monthly_breakdown(aggregator: StatsAggregator) -> None:
             f"{total:,}",
             f"[green]{bar}[/green]",
         )
+
+    console.print(table)
+
+
+def _get_top_code_languages(aggregator: StatsAggregator, top_n: int) -> list[str]:
+    """Get top N programming languages by total lines (excluding config/lock files)."""
+    lang_totals: dict[str, int] = defaultdict(int)
+    for ext, stats in aggregator.by_extension.items():
+        if _is_code_extension(ext):
+            lang_totals[ext] += stats.additions + stats.deletions
+    top_langs = sorted(lang_totals.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    return [lang for lang, _ in top_langs]
+
+
+def _aggregate_monthly_by_language(
+    aggregator: StatsAggregator, top_lang_names: list[str]
+) -> dict[str, dict[str, int]]:
+    """Aggregate lines by month and language."""
+    monthly_by_lang: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    for pr in aggregator.prs:
+        month = _parse_date(pr.merged_at).strftime("%Y-%m")
+        for ext, stats in pr.by_extension.items():
+            if ext in top_lang_names:
+                monthly_by_lang[month][ext] += stats.additions + stats.deletions
+
+    for commit in aggregator.direct_commits:
+        month = _parse_date(commit.committed_at).strftime("%Y-%m")
+        for ext, stats in commit.by_extension.items():
+            if ext in top_lang_names:
+                monthly_by_lang[month][ext] += stats.additions + stats.deletions
+
+    return monthly_by_lang
+
+
+def display_monthly_by_language(aggregator: StatsAggregator, top_n: int = 3) -> None:
+    """Display lines of code per month for top N programming languages."""
+    top_lang_names = _get_top_code_languages(aggregator, top_n)
+    if not top_lang_names:
+        return
+
+    monthly_by_lang = _aggregate_monthly_by_language(aggregator, top_lang_names)
+    if not monthly_by_lang:
+        return
+
+    # Build table
+    table = Table(title=f"Lines by Month - Top {len(top_lang_names)} Languages")
+    table.add_column("Month", style="cyan")
+
+    # Add column for each top language
+    colors = ["green", "blue", "magenta", "yellow", "red"]
+    for i, lang in enumerate(top_lang_names):
+        table.add_column(lang, style=colors[i % len(colors)], justify="right")
+    table.add_column("Total", style="white", justify="right")
+
+    for month in sorted(monthly_by_lang.keys()):
+        row: list[str] = [month]
+        month_total = 0
+        for lang in top_lang_names:
+            count = monthly_by_lang[month].get(lang, 0)
+            month_total += count
+            row.append(f"{count:,}" if count > 0 else "-")
+        row.append(f"{month_total:,}")
+        table.add_row(*row)
 
     console.print(table)
 

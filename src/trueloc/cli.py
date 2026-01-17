@@ -19,6 +19,7 @@ from trueloc.display import (
     display_local_commits_table,
     display_local_summary,
     display_monthly_breakdown,
+    display_monthly_by_language,
     display_repo_breakdown,
     display_summary,
     display_top_contributions,
@@ -244,6 +245,8 @@ def count(  # noqa: PLR0913
         if aggregator.prs or aggregator.direct_commits:
             # Show aggregate statistics instead of per-item tables
             display_monthly_breakdown(aggregator)
+            console.print()
+            display_monthly_by_language(aggregator)
             console.print()
             display_repo_breakdown(aggregator)
             console.print()
