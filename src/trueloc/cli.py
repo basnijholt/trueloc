@@ -15,6 +15,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 
 from trueloc.display import (
     display_activity_stats,
+    display_commits_per_month,
     display_extension_table,
     display_local_commits_table,
     display_local_summary,
@@ -61,8 +62,9 @@ def _process_pr(  # noqa: PLR0913
     if was_cached:
         aggregator.cache_hits += 1
 
+    # Always get commit count for stats; also track SHAs for direct commit filtering
+    pr_commits = gh.get_pr_commits(repo, pr["number"])
     if include_direct_commits:
-        pr_commits = gh.get_pr_commits(repo, pr["number"])
         aggregator.pr_commit_shas.update(pr_commits)
 
     aggregator.add_pr(
@@ -74,6 +76,7 @@ def _process_pr(  # noqa: PLR0913
             deletions=deletions,
             merged_at=pr["merged_at"][:10],
             by_extension=by_ext,
+            commit_count=len(pr_commits),
         )
     )
 
@@ -123,7 +126,7 @@ def _process_direct_commits(  # noqa: PLR0913
 
 
 @app.command()
-def count(  # noqa: PLR0913
+def count(  # noqa: PLR0913, PLR0915
     username: str = typer.Argument(..., help="GitHub username"),
     since: str = typer.Option(
         ..., "--since", "-s", help="Start date (e.g., 5d, 2w, 3m, 1y, 'last month', 2024-01-01)"
@@ -249,6 +252,8 @@ def count(  # noqa: PLR0913
             display_monthly_breakdown(aggregator)
             console.print()
             display_monthly_by_language(aggregator)
+            console.print()
+            display_commits_per_month(aggregator)
             console.print()
             display_repo_breakdown(aggregator)
             console.print()

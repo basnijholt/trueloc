@@ -132,6 +132,63 @@ def display_monthly_breakdown(aggregator: StatsAggregator) -> None:
     console.print(table)
 
 
+def display_commits_per_month(aggregator: StatsAggregator) -> None:
+    """Display commit statistics per month with bar visualization."""
+    if not aggregator.prs and not aggregator.direct_commits:
+        return
+
+    monthly: dict[str, dict[str, int | float]] = defaultdict(
+        lambda: {"pr_commits": 0, "direct_commits": 0, "pr_count": 0}
+    )
+
+    # Aggregate PR commits by month
+    for pr in aggregator.prs:
+        month = _parse_date(pr.merged_at).strftime("%Y-%m")
+        monthly[month]["pr_commits"] += pr.commit_count
+        monthly[month]["pr_count"] += 1
+
+    # Aggregate direct commits by month
+    for commit in aggregator.direct_commits:
+        month = _parse_date(commit.committed_at).strftime("%Y-%m")
+        monthly[month]["direct_commits"] += 1
+
+    if not monthly:
+        return
+
+    table = Table(title="Commits per Month")
+    table.add_column("Month", style="cyan")
+    table.add_column("PR Commits", style="green", justify="right")
+    table.add_column("Direct", style="blue", justify="right")
+    table.add_column("Total", style="white", justify="right")
+    table.add_column("PRs", style="magenta", justify="right")
+    table.add_column("Avg/PR", style="dim", justify="right")
+    table.add_column("", style="dim")  # Bar chart
+
+    max_total = max((m["pr_commits"] + m["direct_commits"]) for m in monthly.values())
+
+    for month in sorted(monthly.keys()):
+        stats = monthly[month]
+        pr_commits = int(stats["pr_commits"])
+        direct = int(stats["direct_commits"])
+        total = pr_commits + direct
+        pr_count = int(stats["pr_count"])
+        avg = pr_commits / pr_count if pr_count > 0 else 0
+        bar_width = int((total / max_total) * 20) if max_total > 0 else 0
+        bar = "█" * bar_width
+
+        table.add_row(
+            month,
+            f"{pr_commits:,}",
+            f"{direct:,}" if direct > 0 else "-",
+            f"{total:,}",
+            f"{pr_count:,}" if pr_count > 0 else "-",
+            f"{avg:.1f}" if pr_count > 0 else "-",
+            f"[green]{bar}[/green]",
+        )
+
+    console.print(table)
+
+
 def _get_top_code_languages(aggregator: StatsAggregator, top_n: int) -> list[str]:
     """Get top N programming languages by total lines (excluding config/lock files)."""
     lang_totals: dict[str, int] = defaultdict(int)
