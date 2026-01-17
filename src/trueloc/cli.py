@@ -118,7 +118,7 @@ def _process_direct_commits(  # noqa: PLR0913
 
 
 @app.command()
-def count(  # noqa: PLR0913
+def count(  # noqa: PLR0913, C901
     username: str = typer.Argument(..., help="GitHub username"),
     since: str = typer.Option(
         ..., "--since", "-s", help="Start date (e.g., 5d, 2w, 3m, 1y, 'last month', 2024-01-01)"
@@ -147,6 +147,12 @@ def count(  # noqa: PLR0913
         False,  # noqa: FBT003
         "--json",
         help="Output results as JSON for scripting",
+    ),
+    repo: str | None = typer.Option(
+        None,
+        "--repo",
+        "-r",
+        help="Only process a single repository (e.g., 'owner/repo' or 'repo')",
     ),
 ) -> None:
     """Count lines of code from merged PRs and direct commits.
@@ -184,9 +190,15 @@ def count(  # noqa: PLR0913
         gh = GitHubClient(client, cache)
 
         # Fetch repos
-        fetch_task = progress.add_task("Fetching repositories...", total=None, status="")
-        repos = gh.get_user_repos(username)
-        progress.remove_task(fetch_task)
+        if repo:
+            # Single repo mode - construct full name if needed
+            if "/" not in repo:
+                repo = f"{username}/{repo}"
+            repos = [repo]
+        else:
+            fetch_task = progress.add_task("Fetching repositories...", total=None, status="")
+            repos = gh.get_user_repos(username)
+            progress.remove_task(fetch_task)
 
         # Main repo progress
         repo_task = progress.add_task(
