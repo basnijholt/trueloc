@@ -36,10 +36,13 @@ trueloc gives you the **true** picture of your coding activity.
 ## Quick Start
 
 ```bash
-# Install
-pip install trueloc
+# Install (recommended)
+uv tool install trueloc
 
-# Authenticate with GitHub
+# Or run directly without installing
+uvx trueloc count USERNAME --since 1m
+
+# Authenticate with GitHub (if not already)
 gh auth login
 
 # Count your lines since a date

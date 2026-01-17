@@ -28,16 +28,22 @@ gh auth login
 
 ## Installation
 
+=== "uv tool (Recommended)"
+
+    ```bash
+    uv tool install trueloc
+    ```
+
+=== "uvx (Run without installing)"
+
+    ```bash
+    uvx trueloc count USERNAME --since 1m
+    ```
+
 === "pip"
 
     ```bash
     pip install trueloc
-    ```
-
-=== "uv"
-
-    ```bash
-    uv pip install trueloc
     ```
 
 === "pipx"

@@ -19,13 +19,19 @@ Counts ALL lines touched across every commit in a PR—even for squash merges wh
 
 ## Installation
 
+Recommended (installs in isolated environment):
 ```bash
-pip install trueloc
+uv tool install trueloc
 ```
 
-Or with uv:
+Or run directly without installing:
 ```bash
-uv pip install trueloc
+uvx trueloc count USERNAME --since 1m
+```
+
+Alternatively, with pip:
+```bash
+pip install trueloc
 ```
 
 Requires the GitHub CLI (`gh`) to be installed and authenticated:
