@@ -105,6 +105,7 @@ def display_monthly_breakdown(aggregator: StatsAggregator) -> None:
     table.add_column("Additions", style="green", justify="right")
     table.add_column("Deletions", style="red", justify="right")
     table.add_column("Total", style="white", justify="right")
+    table.add_column("Net", justify="right")
     table.add_column("", style="dim")  # Bar chart
 
     max_total = max((m["additions"] + m["deletions"]) for m in monthly.values())
@@ -112,14 +113,19 @@ def display_monthly_breakdown(aggregator: StatsAggregator) -> None:
     for month in sorted(monthly.keys()):
         stats = monthly[month]
         total = stats["additions"] + stats["deletions"]
+        net = stats["additions"] - stats["deletions"]
         bar_width = int((total / max_total) * 30) if max_total > 0 else 0
         bar = "█" * bar_width
+
+        # Format net with color and sign
+        net_str = f"[green]+{net:,}[/green]" if net >= 0 else f"[red]{net:,}[/red]"
 
         table.add_row(
             month,
             f"+{stats['additions']:,}",
             f"-{stats['deletions']:,}",
             f"{total:,}",
+            net_str,
             f"[green]{bar}[/green]",
         )
 
@@ -383,6 +389,120 @@ def display_activity_stats(aggregator: StatsAggregator) -> None:
             bar_width = int((count / max_day) * 20) if max_day > 0 else 0
             bar = "▓" * bar_width
             console.print(f"    {day_name}: [green]{bar}[/green] {count:,}")
+
+
+def _calculate_test_ratio(aggregator: StatsAggregator) -> tuple[int, int]:
+    """Calculate test and code lines from PRs and commits.
+
+    Returns (test_lines, code_lines) tuple.
+    """
+    test_lines = 0
+    code_lines = 0
+    code_extensions = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".rb", ".php"}
+
+    for pr in aggregator.prs:
+        for ext, stats in pr.by_extension.items():
+            if ext.lower() in code_extensions:
+                lines = stats.additions + stats.deletions
+                code_lines += lines
+                if "test" in pr.title.lower():
+                    test_lines += lines
+
+    for commit in aggregator.direct_commits:
+        for ext, stats in commit.by_extension.items():
+            if ext.lower() in code_extensions:
+                lines = stats.additions + stats.deletions
+                code_lines += lines
+                if "test" in commit.message.lower():
+                    test_lines += lines
+
+    # Also count files with test extensions patterns
+    test_ext_lines = sum(
+        stats.additions + stats.deletions
+        for ext, stats in aggregator.by_extension.items()
+        if ext.lower() in {".spec.ts", ".spec.js", ".test.ts", ".test.js", ".test.py"}
+    )
+    return test_lines + test_ext_lines, code_lines
+
+
+def display_quality_indicators(aggregator: StatsAggregator) -> None:
+    """Display quality indicators like test/doc file ratios."""
+    if not aggregator.by_extension:
+        return
+
+    total_lines = aggregator.total_additions + aggregator.total_deletions
+    if total_lines == 0:
+        return
+
+    # Calculate documentation ratio from extensions
+    doc_extensions = {".md", ".rst", ".txt", ".adoc"}
+    doc_lines = sum(
+        stats.additions + stats.deletions
+        for ext, stats in aggregator.by_extension.items()
+        if ext.lower() in doc_extensions
+    )
+    doc_ratio = (doc_lines / total_lines * 100) if total_lines > 0 else 0
+
+    # Calculate test ratio
+    test_lines, code_lines = _calculate_test_ratio(aggregator)
+    test_ratio = (test_lines / code_lines * 100) if code_lines > 0 else 0
+
+    # Calculate churn ratio
+    churn_ratio = (
+        (aggregator.total_deletions / aggregator.total_additions * 100)
+        if aggregator.total_additions > 0
+        else 0
+    )
+
+    console.print()
+    console.print("[bold]Quality Indicators[/bold]")
+    console.print(f"  Documentation: [cyan]{doc_ratio:.1f}%[/cyan] of total lines")
+    if test_ratio > 0:
+        console.print(
+            f"  Test-related: [cyan]~{test_ratio:.1f}%[/cyan] of code lines [dim](estimated)[/dim]"
+        )
+    del_count = aggregator.total_deletions
+    add_count = aggregator.total_additions
+    console.print(
+        f"  Code churn: [cyan]{churn_ratio:.1f}%[/cyan] "
+        f"[dim]({del_count:,} deleted per {add_count:,} added)[/dim]"
+    )
+
+
+def display_pr_size_distribution(aggregator: StatsAggregator) -> None:
+    """Display histogram of PR sizes."""
+    if not aggregator.prs:
+        return
+
+    # Define buckets
+    buckets = [
+        (0, 100, "<100"),
+        (100, 500, "100-500"),
+        (500, 1000, "500-1K"),
+        (1000, 5000, "1K-5K"),
+        (5000, float("inf"), ">5K"),
+    ]
+
+    counts: dict[str, int] = {label: 0 for _, _, label in buckets}
+
+    for pr in aggregator.prs:
+        size = pr.additions + pr.deletions
+        for low, high, label in buckets:
+            if low <= size < high:
+                counts[label] += 1
+                break
+
+    total_prs = len(aggregator.prs)
+    max_count = max(counts.values()) if counts else 0
+
+    console.print()
+    console.print("[bold]PR Size Distribution[/bold]")
+    for _, _, label in buckets:
+        count = counts[label]
+        pct = (count / total_prs * 100) if total_prs > 0 else 0
+        bar_width = int((count / max_count) * 20) if max_count > 0 else 0
+        bar = "▓" * bar_width
+        console.print(f"  {label:>8}: [green]{bar:<20}[/green] {count:>4} ({pct:>5.1f}%)")
 
 
 def display_summary(aggregator: StatsAggregator, since: str, *, per_commit: bool) -> None:

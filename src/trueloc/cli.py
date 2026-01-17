@@ -20,6 +20,8 @@ from trueloc.display import (
     display_local_summary,
     display_monthly_breakdown,
     display_monthly_by_language,
+    display_pr_size_distribution,
+    display_quality_indicators,
     display_repo_breakdown,
     display_summary,
     display_top_contributions,
@@ -259,6 +261,8 @@ def count(  # noqa: PLR0913
                 )
 
             display_activity_stats(aggregator)
+            display_pr_size_distribution(aggregator)
+            display_quality_indicators(aggregator)
 
         display_summary(aggregator, since, per_commit=per_commit)
 
