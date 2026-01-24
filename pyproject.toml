@@ -64,7 +64,7 @@ unused-ignore-comment = "ignore"
 
 [dependency-groups]
 dev = ["mypy>=1.14", "pre-commit>=4", "ruff>=0.9", "pytest>=8", "pytest-cov>=4", "respx>=0.21", "ty"]
-docs = ["zensical", "markdown-gfm-admonition"]
+docs = ["zensical", "markdown-gfm-admonition", "markdown-code-runner>=2.7.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
