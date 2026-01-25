@@ -325,6 +325,7 @@ Congratulations! You've written over a million lines of code since 1y!
 
 <!-- OUTPUT:END -->
 
+<!-- SECTION:features:START -->
 ## Features
 
 - **Per-commit counting** (default): Counts every line touched in every commit
@@ -335,6 +336,7 @@ Congratulations! You've written over a million lines of code since 1y!
 - **Disk caching**: Uses diskcache to avoid hammering the GitHub API
 - **Rate limit handling**: Automatically waits when rate limited with progress bar
 - **Flexible dates**: Supports relative (`5d`, `2w`, `3m`, `1y`) and natural language (`last month`)
+<!-- SECTION:features:END -->
 
 ## Caching Strategy
 
@@ -343,6 +345,7 @@ Congratulations! You've written over a million lines of code since 1y!
 
 Cache is stored in `~/.cache/trueloc/`.
 
+<!-- SECTION:tech-stack:START -->
 ## Tech Stack
 
 - Python 3.12+
@@ -353,6 +356,7 @@ Cache is stored in `~/.cache/trueloc/`.
 - [dateparser](https://dateparser.readthedocs.io/) - Flexible date parsing
 - [Hatch](https://hatch.pypa.io/) - Build system
 - [Ruff](https://docs.astral.sh/ruff/) + [mypy](https://mypy-lang.org/) - Linting/typing
+<!-- SECTION:tech-stack:END -->
 
 ## Development
 
