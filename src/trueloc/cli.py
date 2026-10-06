@@ -71,9 +71,10 @@ def _process_pr(  # noqa: PLR0913
     pr_commits = gh.get_pr_commits_raw(repo, pr["number"])
     if include_direct_commits:
         aggregator.pr_commit_shas.update(c["sha"] for c in pr_commits)
-        # Squash and rebase merges put new commits on the default branch
+        # The squash commit (or last rebased commit) on the default branch
         if pr.get("merge_commit_sha"):
             aggregator.pr_commit_shas.add(pr["merge_commit_sha"])
+        # Rebase merges copy every PR commit with a new SHA
         aggregator.pr_commit_fingerprints.update(_commit_fingerprint(c) for c in pr_commits)
 
     aggregator.add_pr(
