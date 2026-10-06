@@ -174,6 +174,8 @@ class GitHubClient:
         """Report a skipped API call, so missing data is not silent."""
         if isinstance(error, httpx.HTTPStatusError) and error.response is not None:
             reason = f" (HTTP {error.response.status_code})"
+        elif isinstance(error, GraphQLError):
+            reason = f" (GraphQL: {error})"
         elif error is not None:
             reason = f" ({type(error).__name__})"
         else:

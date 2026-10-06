@@ -495,7 +495,8 @@ class TestGitHubClientAPI:
         )
         # Repos found before the error are kept, and the failure is reported
         assert repos == ["org/a"]
-        assert "Skipping discovering contributed repos for testuser" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "Skipping discovering contributed repos for testuser (GraphQL: x)" in err
 
     def test_get_contributed_repos_http_error_warns(
         self, gh_client: GitHubClient, respx_mock: respx.Router
