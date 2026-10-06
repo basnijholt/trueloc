@@ -78,7 +78,7 @@ trueloc count YOUR_USERNAME --since 1m
 
 This will:
 
-1. Fetch all repositories you have access to
+1. Find your repositories plus every repository you contributed to (including organization, upstream, and private repos)
 2. Find merged PRs and direct commits since the specified date
 3. Count lines added and deleted across all commits
 4. Display a summary with per-PR breakdown and file type analysis
