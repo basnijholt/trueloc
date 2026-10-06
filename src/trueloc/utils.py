@@ -6,7 +6,7 @@ import atexit
 import re
 import shutil
 import subprocess
-from datetime import timedelta
+from datetime import UTC, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -50,6 +50,11 @@ def get_cache(no_cache: bool) -> diskcache.Cache:  # noqa: FBT001
         atexit.register(shutil.rmtree, cache.directory, ignore_errors=True)
         return cache
     return diskcache.Cache(str(CACHE_DIR))
+
+
+def to_utc(local: datetime) -> datetime:
+    """Convert a naive local datetime to naive UTC, the convention for GitHub dates."""
+    return local.astimezone(UTC).replace(tzinfo=None)
 
 
 def parse_date(date_str: str) -> datetime:

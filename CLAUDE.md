@@ -26,12 +26,14 @@ Cache lives at `~/.cache/trueloc/` using diskcache with SQLite backend.
 - `pr_stats_net:{repo}:{pr_number}` - Net diff PR stats (immutable)
 - `commit_stats:{repo}:{sha}` - Individual commit stats (immutable)
 - `user_repos_v2:{user}` - Owned non-fork repos (7 days)
-- `merged_prs_v2:{repo}:{author}` - Merged PRs with `cached_since`/`cached_until` watermarks
+- `merged_prs_v3:{repo}:{author}` - Merged PRs with `cached_since`/`cached_until` watermarks
 - `merged_prs_search:{author}:{repo}` - Merged PRs from GraphQL search (same watermarks, UTC)
 - `repo_info:{repo}` - Default branch and size (7 days)
-- `branch_commits_v2:{repo}:{branch}:{author}` - Branch commits with range-aware caching
+- `branch_commits_v3:{repo}:{branch}:{author}` - Branch commits with range-aware caching
 
-The `v2` keys use range-aware caching: they store `cached_since`/`cached_until` timestamps and only fetch the missing ranges on subsequent calls. Merged PRs are re-checked for newly merged ones once `cached_until` is older than `PR_REFRESH_INTERVAL` (1 hour).
+Dates are naive UTC everywhere (like the dates GitHub returns); `count` converts `--since`/`--until` once with `to_utc()`, and requests send explicit `Z` timestamps (GitHub reads timestamps without a timezone as US Pacific time). Direct commits are filtered by author date.
+
+These keys use range-aware caching: they store `cached_since`/`cached_until` timestamps and only fetch the missing ranges on subsequent calls. Merged PRs are re-checked for newly merged ones once `cached_until` is older than `PR_REFRESH_INTERVAL` (1 hour).
 
 ### GitHub API Flow
 

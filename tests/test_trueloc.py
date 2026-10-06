@@ -33,8 +33,8 @@ if TYPE_CHECKING:
 
 
 def _utc(dt: datetime) -> str:
-    """Format a naive local datetime as the UTC string sent to GraphQL."""
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Format a naive UTC datetime as the string sent to GitHub."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @pytest.fixture
@@ -791,7 +791,7 @@ class TestGitHubClientPRCaching:
             assert route.call_count == 1
 
             # Verify cache was populated
-            cache_key = "merged_prs_v2:user/repo:testuser"
+            cache_key = "merged_prs_v3:user/repo:testuser"
             cached = memory_cache.get(cache_key)
             assert cached is not None
             assert cached["cached_since"] == since.isoformat()
@@ -854,7 +854,7 @@ class TestGitHubClientPRCaching:
     ) -> None:
         """Test that requesting older data fetches only the gap."""
         # Pre-populate cache with data from Jan 8 onwards
-        cache_key = "merged_prs_v2:user/repo:testuser"
+        cache_key = "merged_prs_v3:user/repo:testuser"
         memory_cache.set(
             cache_key,
             {
@@ -987,7 +987,7 @@ class TestGitHubClientPRCaching:
         self, memory_cache: diskcache.Cache, respx_mock: respx.Router
     ) -> None:
         """PRs merged after the cache was written must show up on later runs."""
-        cache_key = "merged_prs_v2:user/repo:testuser"
+        cache_key = "merged_prs_v3:user/repo:testuser"
         cached_until = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=2)
         old_pr = {"number": 1, "merged_at": "2024-01-10T10:00:00Z", "user": {"login": "testuser"}}
         memory_cache.set(
@@ -1031,7 +1031,7 @@ class TestGitHubClientPRCaching:
         self, memory_cache: diskcache.Cache, respx_mock: respx.Router
     ) -> None:
         """Entries without cached_until are refreshed from cached_since, deduped by number."""
-        cache_key = "merged_prs_v2:user/repo:testuser"
+        cache_key = "merged_prs_v3:user/repo:testuser"
         pr1 = {"number": 1, "merged_at": "2024-01-10T10:00:00Z", "user": {"login": "testuser"}}
         memory_cache.set(cache_key, {"cached_since": "2024-01-08T00:00:00", "prs": [pr1]})
         refreshed_pr1 = {**pr1, "title": "refreshed", "updated_at": "2024-01-12T10:00:00Z"}
@@ -1191,8 +1191,8 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": since.isoformat(),
-                "until": until.isoformat(),
+                "since": _utc(since),
+                "until": _utc(until),
                 "per_page": "100",
                 "page": "1",
             },
@@ -1211,8 +1211,8 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": since.isoformat(),
-                "until": until.isoformat(),
+                "since": _utc(since),
+                "until": _utc(until),
                 "per_page": "100",
                 "page": "2",
             },
@@ -1249,8 +1249,8 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": since_wide.isoformat(),
-                "until": until.isoformat(),
+                "since": _utc(since_wide),
+                "until": _utc(until),
                 "per_page": "100",
                 "page": "1",
             },
@@ -1269,8 +1269,8 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": since_wide.isoformat(),
-                "until": until.isoformat(),
+                "since": _utc(since_wide),
+                "until": _utc(until),
                 "per_page": "100",
                 "page": "2",
             },
@@ -1303,7 +1303,7 @@ class TestGitHubClientBranchCommits:
     ) -> None:
         """Test that requesting older data fetches only the gap."""
         # Pre-populate cache with data from Jan 10 to Jan 31
-        cache_key = "branch_commits_v2:user/repo:main:testuser"
+        cache_key = "branch_commits_v3:user/repo:main:testuser"
         memory_cache.set(
             cache_key,
             {
@@ -1321,8 +1321,8 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": "2024-01-01T00:00:00",
-                "until": "2024-01-10T00:00:00",
+                "since": "2024-01-01T00:00:00Z",
+                "until": "2024-01-10T00:00:00Z",
                 "per_page": "100",
                 "page": "1",
             },
@@ -1340,8 +1340,8 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": "2024-01-01T00:00:00",
-                "until": "2024-01-10T00:00:00",
+                "since": "2024-01-01T00:00:00Z",
+                "until": "2024-01-10T00:00:00Z",
                 "per_page": "100",
                 "page": "2",
             },
@@ -1374,7 +1374,7 @@ class TestGitHubClientBranchCommits:
     ) -> None:
         """Test that requesting newer data fetches only the gap."""
         # Pre-populate cache with data from Jan 1 to Jan 20
-        cache_key = "branch_commits_v2:user/repo:main:testuser"
+        cache_key = "branch_commits_v3:user/repo:main:testuser"
         memory_cache.set(
             cache_key,
             {
@@ -1392,8 +1392,8 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": "2024-01-20T00:00:00",
-                "until": "2024-01-31T00:00:00",
+                "since": "2024-01-20T00:00:00Z",
+                "until": "2024-01-31T00:00:00Z",
                 "per_page": "100",
                 "page": "1",
             },
@@ -1411,8 +1411,8 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": "2024-01-20T00:00:00",
-                "until": "2024-01-31T00:00:00",
+                "since": "2024-01-20T00:00:00Z",
+                "until": "2024-01-31T00:00:00Z",
                 "per_page": "100",
                 "page": "2",
             },
@@ -1664,7 +1664,7 @@ class TestGitHubClientFailures:
             "user/repo", "main", "user", datetime(2024, 1, 1), datetime(2024, 2, 1)
         )
         assert commits == []
-        assert "branch_commits_v2:user/repo:main:user" not in gh_client.cache
+        assert "branch_commits_v3:user/repo:main:user" not in gh_client.cache
 
     def test_merged_prs_error_skips_repo(
         self, gh_client: GitHubClient, respx_mock: respx.Router
@@ -1673,14 +1673,14 @@ class TestGitHubClientFailures:
             return_value=httpx.Response(404, headers=self.HEADERS)
         )
         assert gh_client.get_merged_prs("user/repo", "user", datetime(2024, 1, 1)) == []
-        assert "merged_prs_v2:user/repo:user" not in gh_client.cache
+        assert "merged_prs_v3:user/repo:user" not in gh_client.cache
 
     def test_merged_prs_gap_error_returns_cached(
         self, gh_client: GitHubClient, respx_mock: respx.Router
     ) -> None:
         cached_pr = {"number": 1, "merged_at": "2024-01-10T10:00:00Z", "user": {"login": "u"}}
         gh_client.cache.set(
-            "merged_prs_v2:user/repo:u",
+            "merged_prs_v3:user/repo:u",
             {"cached_since": "2024-01-08T00:00:00", "prs": [cached_pr]},
         )
         respx_mock.get("https://api.github.com/repos/user/repo/pulls").mock(
@@ -1688,7 +1688,7 @@ class TestGitHubClientFailures:
         )
         assert gh_client.get_merged_prs("user/repo", "u", datetime(2024, 1, 1)) == [cached_pr]
         # Watermark is not moved back, so the gap is retried next run
-        cached = gh_client.cache.get("merged_prs_v2:user/repo:u")
+        cached = gh_client.cache.get("merged_prs_v3:user/repo:u")
         assert cached["cached_since"] == "2024-01-08T00:00:00"
 
     def test_branch_commits_gap_error_returns_cached(
@@ -1696,7 +1696,7 @@ class TestGitHubClientFailures:
     ) -> None:
         commit = {"sha": "abc", "commit": {"author": {"date": "2024-01-10T10:00:00Z"}}}
         gh_client.cache.set(
-            "branch_commits_v2:user/repo:main:u",
+            "branch_commits_v3:user/repo:main:u",
             {
                 "cached_since": "2024-01-05T00:00:00",
                 "cached_until": "2024-01-20T00:00:00",

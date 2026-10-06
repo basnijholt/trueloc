@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shutil
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +34,7 @@ from trueloc.github import GitHubClient
 from trueloc.local import get_commit_numstat, get_local_commits
 from trueloc.mirror import RepoMirrors, git_supports_env_config
 from trueloc.models import CommitStats, FileStats, LocalCommitStats, PRStats, StatsAggregator
-from trueloc.utils import CACHE_DIR, get_cache, get_github_token, parse_date
+from trueloc.utils import CACHE_DIR, get_cache, get_github_token, parse_date, to_utc
 
 app = typer.Typer(
     help="Count lines of code from GitHub pull requests.",
@@ -297,8 +297,9 @@ def count(  # noqa: PLR0913
     Use --net to count only the final diff (net additions/deletions).
     Use --no-direct-commits to exclude direct commits to main branch.
     """
-    since_date = parse_date(since)
-    until_date = parse_date(until) if until else datetime.now()  # noqa: DTZ005
+    # Naive UTC throughout, like the dates GitHub returns
+    since_date = to_utc(parse_date(since))
+    until_date = to_utc(parse_date(until)) if until else datetime.now(UTC).replace(tzinfo=None)
 
     token = get_github_token()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
