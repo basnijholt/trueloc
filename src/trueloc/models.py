@@ -73,6 +73,8 @@ class StatsAggregator:
     by_extension: dict[str, FileStats] = field(default_factory=lambda: defaultdict(FileStats))
     cache_hits: int = 0
     pr_commit_shas: set[str] = field(default_factory=set)
+    # (author date, message) of PR commits, to detect rebase-merged copies with new SHAs
+    pr_commit_fingerprints: set[tuple[str, str]] = field(default_factory=set)
 
     def add_extension_stats(self, by_ext: dict[str, FileStats]) -> None:
         """Merge extension stats into totals."""

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -12,14 +12,44 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from trueloc.models import FileStats
-from trueloc.utils import RATE_LIMIT_BUFFER, TTL_IMMUTABLE, TTL_MUTABLE, get_file_extension
+from trueloc.utils import (
+    PR_REFRESH_INTERVAL,
+    RATE_LIMIT_BUFFER,
+    REFRESH_OVERLAP,
+    TTL_IMMUTABLE,
+    TTL_MUTABLE,
+    get_file_extension,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     import diskcache  # type: ignore[import-untyped]
 
-console = Console()
+console = Console(stderr=True)  # Keep stdout clean for --json
+
+CONTRIBUTED_REPOS_QUERY = """
+query($login: String!, $from: DateTime!, $to: DateTime!) {
+  user(login: $login) {
+    contributionsCollection(from: $from, to: $to) {
+      pullRequestContributionsByRepository(maxRepositories: 100) {
+        repository { nameWithOwner }
+      }
+      commitContributionsByRepository(maxRepositories: 100) {
+        repository { nameWithOwner }
+      }
+    }
+  }
+}
+"""
+MAX_CONTRIBUTED_REPOS = 100  # maxRepositories limit of contributionsCollection
+MAX_CONTRIBUTIONS_WINDOW = timedelta(days=365)  # contributionsCollection spans at most a year
+# PR contributions count when a PR is opened, so look back to catch PRs merged later
+CONTRIBUTIONS_LOOKBACK = timedelta(days=365)
+
+
+class GraphQLError(Exception):
+    """GraphQL request returned errors (GraphQL reports these with HTTP 200)."""
 
 
 class GitHubClient:
@@ -82,11 +112,14 @@ class GitHubClient:
         endpoint: str,
         params: dict[str, Any] | None = None,
         max_retries: int = 3,
+        *,
+        method: str = "GET",
+        json: dict[str, Any] | None = None,
     ) -> httpx.Response:
         """Make a request with rate limit handling."""
         response: httpx.Response | None = None
         for _attempt in range(max_retries):
-            response = self.client.get(endpoint, params=params)
+            response = self.client.request(method, endpoint, params=params, json=json)
 
             if self._is_rate_limited(response):
                 self._wait_for_rate_limit(response)
@@ -137,15 +170,77 @@ class GitHubClient:
         self.cache.set(cache_key, result, expire=ttl)
         return result
 
+    def _warn_skipped(self, repo: str, what: str, error: Exception | None = None) -> None:
+        """Report a skipped API call, so missing data is not silent."""
+        if isinstance(error, httpx.HTTPStatusError) and error.response is not None:
+            reason = f" (HTTP {error.response.status_code})"
+        elif isinstance(error, GraphQLError):
+            reason = f" (GraphQL: {error})"
+        elif error is not None:
+            reason = f" ({type(error).__name__})"
+        else:
+            reason = ""
+        console.print(f"[yellow]Skipping {what} for {repo}{reason}[/yellow]")
+
     def get_user_repos(self, username: str) -> list[str]:
         """Get all repositories for a user."""
-        cache_key = f"user_repos:{username}"
+        cache_key = f"user_repos_v2:{username}"
 
         def fetch() -> list[str]:
             repos_iter = self._paginate(f"/users/{username}/repos", {"type": "owner"})
-            return [repo["full_name"] for repo in repos_iter]
+            # Forks contain synced upstream commits; PRs merged in forks are found via
+            # get_contributed_repos
+            return [repo["full_name"] for repo in repos_iter if not repo["fork"]]
 
         return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
+
+    def _fetch_contributed_repos(self, username: str, since: datetime, until: datetime) -> set[str]:
+        """Fetch repos with PR or commit contributions in a range of at most a year."""
+        variables = {
+            "login": username,
+            # Naive datetimes are local time
+            "from": since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": until.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        response = self._request(
+            "/graphql",
+            method="POST",
+            json={"query": CONTRIBUTED_REPOS_QUERY, "variables": variables},
+        )
+        payload = response.json()
+        errors = payload.get("errors") or []
+        if errors:
+            # Unknown login (e.g. an organization): nothing to discover
+            if all(error.get("type") == "NOT_FOUND" for error in errors):
+                return set()
+            raise GraphQLError("; ".join(error.get("message", "") for error in errors))
+        collection = payload["data"]["user"]["contributionsCollection"]
+        groups = [
+            collection["pullRequestContributionsByRepository"],
+            collection["commitContributionsByRepository"],
+        ]
+        repos = {c["repository"]["nameWithOwner"] for group in groups for c in group}
+
+        # Results were truncated: split the range in half
+        truncated = any(len(group) >= MAX_CONTRIBUTED_REPOS for group in groups)
+        if truncated and until - since > timedelta(days=1):
+            middle = since + (until - since) / 2
+            repos |= self._fetch_contributed_repos(username, since, middle)
+            repos |= self._fetch_contributed_repos(username, middle, until)
+        return repos
+
+    def get_contributed_repos(self, username: str, since: datetime, until: datetime) -> list[str]:
+        """Get all repos (including other owners' and private) the user contributed to."""
+        repos: set[str] = set()
+        start = since - CONTRIBUTIONS_LOOKBACK
+        try:
+            while start < until:
+                end = min(start + MAX_CONTRIBUTIONS_WINDOW, until)
+                repos |= self._fetch_contributed_repos(username, start, end)
+                start = end
+        except (httpx.HTTPStatusError, httpx.TimeoutException, GraphQLError) as e:
+            self._warn_skipped(username, "discovering contributed repos", e)
+        return sorted(repos)
 
     def _fetch_prs_in_range(
         self,
@@ -158,6 +253,10 @@ class GitHubClient:
         result = []
         params = {"state": "closed", "sort": "updated", "direction": "desc"}
         for pr in self._paginate(f"/repos/{repo}/pulls", params):
+            # Sorted by updated_at desc, and merged_at <= updated_at, so no later PR can match
+            updated_at = pr.get("updated_at")
+            if updated_at and datetime.fromisoformat(updated_at).replace(tzinfo=None) < since:
+                break
             if pr["merged_at"] is None:
                 continue
             merged_at = datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None)
@@ -177,14 +276,21 @@ class GitHubClient:
             if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) >= since
         ]
 
-    def _save_pr_cache(self, cache_key: str, since: datetime, prs: list[dict[str, Any]]) -> None:
-        """Save PRs to cache with the given watermark date.
+    def _save_pr_cache(
+        self,
+        cache_key: str,
+        since: datetime,
+        until: datetime,
+        prs: list[dict[str, Any]],
+    ) -> None:
+        """Save PRs to cache with the given watermark dates.
 
-        Uses TTL_IMMUTABLE since range-aware caching handles new PRs by fetching gaps.
+        Uses TTL_IMMUTABLE since range-aware caching fetches PRs merged after `until`
+        (once older than PR_REFRESH_INTERVAL) and older gaps before `since`.
         """
         self.cache.set(
             cache_key,
-            {"cached_since": since.isoformat(), "prs": prs},
+            {"cached_since": since.isoformat(), "cached_until": until.isoformat(), "prs": prs},
             expire=TTL_IMMUTABLE,
         )
 
@@ -198,28 +304,51 @@ class GitHubClient:
 
         Uses smart range-aware caching:
         - If cached range covers requested range, filter locally (instant)
+        - If the cache is older than PR_REFRESH_INTERVAL, fetch PRs merged since then
         - If requesting older data, fetch only the gap and merge
         """
         cache_key = f"merged_prs_v2:{repo}:{username}"
         cached = self.cache.get(cache_key)
+        now = datetime.now(UTC).replace(tzinfo=None)
 
         if cached is None:
-            prs = self._fetch_prs_in_range(repo, username, since)
-            self._save_pr_cache(cache_key, since, prs)
+            try:
+                prs = self._fetch_prs_in_range(repo, username, since)
+            except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+                self._warn_skipped(repo, "PRs", e)
+                return []
+            self._save_pr_cache(cache_key, since, now, prs)
             return prs
 
         cached_since = datetime.fromisoformat(cached["cached_since"])
+        # Entries written before cached_until existed: unknown fetch time, refresh all
+        cached_until = datetime.fromisoformat(cached.get("cached_until", cached["cached_since"]))
         prs = cached["prs"]
 
-        # Requested range is within cached range - filter locally!
-        if since >= cached_since:
+        # Requested range is within cached range and cache is fresh - filter locally!
+        if since >= cached_since and now - cached_until < PR_REFRESH_INTERVAL:
             return self._filter_prs_since(prs, since)
 
-        # Requesting older data - fetch the gap and merge
-        gap_prs = self._fetch_prs_in_range(repo, username, since, cached_since)
-        all_prs = gap_prs + prs
-        self._save_pr_cache(cache_key, since, all_prs)
-        return self._filter_prs_since(all_prs, since)
+        try:
+            # Fetch PRs merged after the cache was written
+            if now - cached_until >= PR_REFRESH_INTERVAL:
+                # Overlap the previous fetch to tolerate clock skew; dedup by PR number below
+                newer_prs = self._fetch_prs_in_range(repo, username, cached_until - REFRESH_OVERLAP)
+                newer_numbers = {pr["number"] for pr in newer_prs}
+                prs = newer_prs + [pr for pr in prs if pr["number"] not in newer_numbers]
+                cached_until = now
+
+            # Requesting older data - fetch the gap and merge
+            if since < cached_since:
+                prs = prs + self._fetch_prs_in_range(repo, username, since, cached_since)
+                cached_since = since
+        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+            # Don't save, so the missing range is retried next run
+            self._warn_skipped(repo, "new or older PRs", e)
+            return self._filter_prs_since(prs, since)
+
+        self._save_pr_cache(cache_key, cached_since, cached_until, prs)
+        return self._filter_prs_since(prs, since)
 
     def get_default_branch(self, repo: str) -> str | None:
         """Get the default branch for a repository."""
@@ -301,6 +430,23 @@ class GitHubClient:
         - If requesting older/newer data, fetch only the gap and merge
         """
         cache_key = f"branch_commits_v2:{repo}:{branch}:{username}"
+        try:
+            return self._get_branch_commits(cache_key, repo, branch, username, since, until)
+        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+            # E.g. 409 for an empty repository; skip the repo instead of aborting the run
+            self._warn_skipped(repo, "direct commits", e)
+            cached = self.cache.get(cache_key)
+            return self._filter_commits_in_range(cached["commits"], since, until) if cached else []
+
+    def _get_branch_commits(  # noqa: PLR0913
+        self,
+        cache_key: str,
+        repo: str,
+        branch: str,
+        username: str,
+        since: datetime,
+        until: datetime,
+    ) -> list[dict[str, Any]]:
         cached = self.cache.get(cache_key)
 
         if cached is None:
@@ -337,14 +483,19 @@ class GitHubClient:
         self._save_commits_cache(cache_key, new_since, new_until, commits)
         return self._filter_commits_in_range(commits, since, until)
 
-    def get_pr_commits_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
-        """Get all commits in a PR (raw API response, cached forever)."""
+    def _get_pr_commits_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]] | None:
+        """Get all commits in a PR, or None if the API call failed."""
         cache_key = f"pr_commits_raw:{repo}:{pr_number}"
 
         def fetch() -> list[dict[str, Any]]:
             return list(self._paginate(f"/repos/{repo}/pulls/{pr_number}/commits"))
 
-        return self._cached_fetch(cache_key, fetch, TTL_IMMUTABLE) or []
+        result: list[dict[str, Any]] | None = self._cached_fetch(cache_key, fetch, TTL_IMMUTABLE)
+        return result
+
+    def get_pr_commits_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        """Get all commits in a PR (raw API response, cached forever)."""
+        return self._get_pr_commits_raw(repo, pr_number) or []
 
     def get_pr_commits(self, repo: str, pr_number: int) -> list[str]:
         """Get all commit SHAs in a PR."""
@@ -369,7 +520,13 @@ class GitHubClient:
         return data
 
     def get_commit_stats(self, repo: str, sha: str) -> tuple[int, int, dict[str, FileStats]]:
-        """Get additions and deletions for a single commit.
+        """Get additions and deletions for a single commit (zeros if the API call failed)."""
+        return self._get_commit_stats(repo, sha) or (0, 0, {})
+
+    def _get_commit_stats(
+        self, repo: str, sha: str
+    ) -> tuple[int, int, dict[str, FileStats]] | None:
+        """Get additions and deletions for a single commit, or None if the API call failed.
 
         Uses cached raw commit data, also caches processed stats for speed.
         """
@@ -384,7 +541,7 @@ class GitHubClient:
         # Get raw data (cached separately for flexibility)
         raw = self.get_commit_raw(repo, sha)
         if raw is None:
-            return 0, 0, {}
+            return None
 
         # Extract and cache processed stats
         result = self._extract_file_stats(raw.get("files", []))
@@ -392,24 +549,18 @@ class GitHubClient:
         self.cache.set(stats_cache_key, (result[0], result[1], ext_data), expire=TTL_IMMUTABLE)
         return result
 
-    def get_pr_files_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
-        """Get all files changed in a PR (raw API response, cached forever)."""
+    def get_pr_files_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]] | None:
+        """Get all files changed in a PR (raw API response, cached forever).
+
+        Returns None if the API call failed, so the failure is not cached.
+        """
         cache_key = f"pr_files_raw:{repo}:{pr_number}"
 
-        cached = self.cache.get(cache_key)
-        if cached is not None:
-            result: list[dict[str, Any]] = cached
-            return result
+        def fetch() -> list[dict[str, Any]]:
+            return list(self._paginate(f"/repos/{repo}/pulls/{pr_number}/files"))
 
-        try:
-            files: list[dict[str, Any]] = list(
-                self._paginate(f"/repos/{repo}/pulls/{pr_number}/files")
-            )
-        except (httpx.HTTPStatusError, httpx.TimeoutException):
-            files = []
-
-        self.cache.set(cache_key, files, expire=TTL_IMMUTABLE)
-        return files
+        result: list[dict[str, Any]] | None = self._cached_fetch(cache_key, fetch, TTL_IMMUTABLE)
+        return result
 
     def get_pr_stats_per_commit(
         self, repo: str, pr_number: int
@@ -427,16 +578,26 @@ class GitHubClient:
         total_additions = 0
         total_deletions = 0
 
-        for sha in self.get_pr_commits(repo, pr_number):
-            add, del_, ext_stats = self.get_commit_stats(repo, sha)
+        commits = self._get_pr_commits_raw(repo, pr_number)
+        complete = commits is not None
+        for commit in commits or []:
+            commit_stats = self._get_commit_stats(repo, commit["sha"])
+            if commit_stats is None:
+                complete = False
+                continue
+            add, del_, ext_stats = commit_stats
             total_additions += add
             total_deletions += del_
             for ext, stats in ext_stats.items():
                 by_extension[ext].additions += stats.additions
                 by_extension[ext].deletions += stats.deletions
 
-        ext_data = {ext: stats.to_tuple() for ext, stats in by_extension.items()}
-        self.cache.set(cache_key, (total_additions, total_deletions, ext_data))
+        # Only cache complete results, so failed API calls are retried next run
+        if not complete:
+            self._warn_skipped(repo, f"some commits of PR #{pr_number}")
+        else:
+            ext_data = {ext: stats.to_tuple() for ext, stats in by_extension.items()}
+            self.cache.set(cache_key, (total_additions, total_deletions, ext_data))
         return total_additions, total_deletions, dict(by_extension)
 
     def get_pr_stats_net(self, repo: str, pr_number: int) -> tuple[int, int, dict[str, FileStats]]:
@@ -454,6 +615,9 @@ class GitHubClient:
 
         # Get raw files (cached separately for flexibility)
         files = self.get_pr_files_raw(repo, pr_number)
+        if files is None:
+            self._warn_skipped(repo, f"files of PR #{pr_number}")
+            return 0, 0, {}
 
         # Extract and cache processed stats
         result = self._extract_file_stats(files)
