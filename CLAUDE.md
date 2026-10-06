@@ -33,6 +33,7 @@ The `v2` keys use range-aware caching: they store `cached_since`/`cached_until` 
 ### GitHub API Flow
 
 1. `get_user_repos()` → user's own non-fork repos, plus `get_contributed_repos()` → repos with PR/commit contributions (GraphQL `contributionsCollection`, includes other owners' and private repos)
+   - Owned forks pushed since `--since` (`get_active_owned_forks()`): direct commits come from `get_fork_commits()`, i.e. commits ahead of the parent, so synced upstream commits are skipped
 2. For each repo: `get_merged_prs()` → PRs merged by user since date
 3. For each PR: `get_pr_stats_per_commit()` or `get_pr_stats_net()`
 4. For direct commits: `get_branch_commits()` → `get_commit_stats()` for each

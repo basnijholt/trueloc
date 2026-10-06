@@ -98,13 +98,17 @@ def _process_direct_commits(  # noqa: PLR0913
     since: datetime,
     until: datetime,
     aggregator: StatsAggregator,
+    *,
+    is_owned_fork: bool = False,
 ) -> None:
     """Process direct commits for a repo and update aggregator."""
-    default_branch = gh.get_default_branch(repo)
-    if not default_branch:
-        return
-
-    branch_commits = gh.get_branch_commits(repo, default_branch, username, since, until)
+    if is_owned_fork:
+        branch_commits = gh.get_fork_commits(repo, username, since, until)
+    else:
+        default_branch = gh.get_default_branch(repo)
+        if not default_branch:
+            return
+        branch_commits = gh.get_branch_commits(repo, default_branch, username, since, until)
 
     for commit in branch_commits:
         sha = commit["sha"]
@@ -140,8 +144,29 @@ def _process_direct_commits(  # noqa: PLR0913
         )
 
 
+def _discover_repos(
+    gh: GitHubClient,
+    username: str,
+    repo: str | None,
+    since: datetime,
+    until: datetime,
+) -> tuple[list[str], set[str]]:
+    """Return the repos to scan, and which of them are the user's own forks."""
+    if repo:
+        # Single repo mode - construct full name if needed
+        if "/" not in repo:
+            repo = f"{username}/{repo}"
+        is_own = repo.split("/")[0].lower() == username.lower()
+        return [repo], {repo} if is_own and gh.get_fork_parent(repo) else set()
+
+    owned = gh.get_user_repos(username)
+    contributed = gh.get_contributed_repos(username, since, until)
+    owned_forks = set(gh.get_active_owned_forks(username, since))
+    return sorted(set(owned) | set(contributed) | owned_forks), owned_forks
+
+
 @app.command()
-def count(  # noqa: PLR0913, PLR0915
+def count(  # noqa: PLR0913
     username: str = typer.Argument(..., help="GitHub username"),
     since: str = typer.Option(
         ..., "--since", "-s", help="Start date (e.g., 5d, 2w, 3m, 1y, 'last month', 2024-01-01)"
@@ -212,26 +237,18 @@ def count(  # noqa: PLR0913, PLR0915
     ):
         gh = GitHubClient(client, cache)
 
-        # Fetch repos
-        if repo:
-            # Single repo mode - construct full name if needed
-            if "/" not in repo:
-                repo = f"{username}/{repo}"
-            repos = [repo]
-        else:
-            fetch_task = progress.add_task("Fetching repositories...", total=None, status="")
-            owned = gh.get_user_repos(username)
-            contributed = gh.get_contributed_repos(username, since_date, until_date)
-            repos = sorted(set(owned) | set(contributed))
-            progress.remove_task(fetch_task)
+        fetch_task = progress.add_task("Fetching repositories...", total=None, status="")
+        repos, owned_forks = _discover_repos(gh, username, repo, since_date, until_date)
+        progress.remove_task(fetch_task)
 
-        # Main repo progress
+        # Process PRs of all repos before direct commits, so PR commits are known when
+        # filtering direct commits in other repos (e.g. a fork whose PR merged upstream)
         repo_task = progress.add_task(
             f"[bold]Repos[/bold] (0/{len(repos)})", total=len(repos), status=""
         )
 
-        for repo_idx, repo in enumerate(repos, 1):
-            short_repo = repo.split("/")[-1][:20]
+        for repo_idx, repo_name in enumerate(repos, 1):
+            short_repo = repo_name.split("/")[-1][:20]
             progress.update(
                 repo_task,
                 description=f"[bold]Repos[/bold] ({repo_idx}/{len(repos)})",
@@ -241,7 +258,7 @@ def count(  # noqa: PLR0913, PLR0915
             # Fetch PRs for this repo
             prs = [
                 pr
-                for pr in gh.get_merged_prs(repo, username, since_date)
+                for pr in gh.get_merged_prs(repo_name, username, since_date)
                 if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) <= until_date
             ]
 
@@ -249,17 +266,29 @@ def count(  # noqa: PLR0913, PLR0915
                 pr_task = progress.add_task("  PRs", total=len(prs), status=f"0/{len(prs)}")
                 for pr in prs:
                     progress.update(pr_task, status=f"#{pr['number']}")
-                    _process_pr(gh, repo, pr, per_commit, aggregator, include_direct_commits)
+                    _process_pr(gh, repo_name, pr, per_commit, aggregator, include_direct_commits)
                     progress.advance(pr_task)
                 progress.remove_task(pr_task)
 
-            # Process direct commits
-            if include_direct_commits:
-                commit_task = progress.add_task("  Direct commits", total=None, status="")
-                _process_direct_commits(gh, repo, username, since_date, until_date, aggregator)
-                progress.remove_task(commit_task)
-
             progress.advance(repo_task)
+        progress.remove_task(repo_task)
+
+        if include_direct_commits:
+            commit_task = progress.add_task(
+                "[bold]Direct commits[/bold]", total=len(repos), status=""
+            )
+            for repo_name in repos:
+                progress.update(commit_task, status=repo_name.split("/")[-1][:20])
+                _process_direct_commits(
+                    gh,
+                    repo_name,
+                    username,
+                    since_date,
+                    until_date,
+                    aggregator,
+                    is_owned_fork=repo_name in owned_forks,
+                )
+                progress.advance(commit_task)
 
     if output_json_flag:
         output_json(aggregator, username, since, until, per_commit=per_commit)
