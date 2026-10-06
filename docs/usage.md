@@ -60,7 +60,7 @@ trueloc count USERNAME --since 2024-01-01 --until 2024-06-30
 
 ### Per-Commit Mode (Default)
 
-Counts every line touched in every commit across all PRs:
+Counts every line touched in every commit across all PRs (merge commits, e.g. merging `main` into a PR branch, are excluded):
 
 ```bash
 trueloc count USERNAME --since 2024-01-01

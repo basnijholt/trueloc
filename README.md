@@ -328,7 +328,7 @@ Congratulations! You've written over a million lines of code since 1y!
 <!-- SECTION:features:START -->
 ## Features
 
-- **Per-commit counting** (default): Counts every line touched in every commit
+- **Per-commit counting** (default): Counts every line touched in every commit (merge commits excluded)
 - **Net diff mode**: Alternative mode that only counts final diff (`--net`)
 - **All your repos**: Your own repos, plus every repo you contributed to (organizations, upstream projects, private repos)
 - **Direct commits**: Includes commits pushed directly to main (not via PR), without double counting squash, rebase, or merge commits of PRs

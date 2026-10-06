@@ -21,7 +21,7 @@ src/trueloc/
 Cache lives at `~/.cache/trueloc/` using diskcache with SQLite backend.
 
 **Cache key patterns:**
-- `pr_stats_per_commit:{repo}:{pr_number}` - Per-commit PR stats (immutable)
+- `pr_stats_per_commit_v2:{repo}:{pr_number}` - Per-commit PR stats, excluding merge commits (immutable)
 - `pr_stats_net:{repo}:{pr_number}` - Net diff PR stats (immutable)
 - `commit_stats:{repo}:{sha}` - Individual commit stats (immutable)
 - `user_repos_v2:{user}` - Owned non-fork repos (7 days)
