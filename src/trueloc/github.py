@@ -15,6 +15,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from trueloc.local import get_commits_numstat, get_existing_commits, get_pr_commits_local
 from trueloc.models import FileStats
 from trueloc.utils import (
+    COMMIT_REFRESH_OVERLAP,
     PR_REFRESH_INTERVAL,
     RATE_LIMIT_BUFFER,
     REFRESH_OVERLAP,
@@ -339,9 +340,8 @@ class GitHubClient:
         """Fetch repos with PR or commit contributions in a range of at most a year."""
         variables = {
             "login": username,
-            # Naive datetimes are local time
-            "from": since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "to": until.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "from": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": until.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         response = self._request(
             "/graphql",
@@ -371,7 +371,10 @@ class GitHubClient:
         return repos
 
     def get_contributed_repos(self, username: str, since: datetime, until: datetime) -> list[str]:
-        """Get all repos (including other owners' and private) the user contributed to."""
+        """Get all repos (including other owners' and private) the user contributed to.
+
+        `since` and `until` are naive UTC, like all dates in GitHubClient.
+        """
         repos: set[str] = set()
         start = since - CONTRIBUTIONS_LOOKBACK
         try:
@@ -448,7 +451,7 @@ class GitHubClient:
         - If the cache is older than PR_REFRESH_INTERVAL, fetch PRs merged since then
         - If requesting older data, fetch only the gap and merge
         """
-        cache_key = f"merged_prs_v2:{repo}:{username}"
+        cache_key = f"merged_prs_v3:{repo}:{username}"
 
         def fetch(start: datetime, end: datetime | None) -> list[dict[str, Any]]:
             return self._fetch_prs_in_range(repo, username, start, end)
@@ -519,16 +522,13 @@ class GitHubClient:
         until: datetime,
         repo: str | None = None,
     ) -> list[dict[str, Any]] | None:
-        """Get PRs by a user merged in [since, until] across all repos, via GraphQL search.
+        """Get PRs by a user merged in [since, until] (naive UTC) across repos, via search.
 
         A few requests per thousand PRs, instead of listing every repo's PRs. PRs have
         the REST fields used elsewhere, plus `repo`, `commit_count`, and `disk_usage`
         (KB). Returns None if the search failed, so callers can fall back to REST.
         """
         cache_key = f"merged_prs_search:{username}:{repo or ''}"
-        # Search dates are in UTC, while `since`/`until` are naive local times
-        since_utc = since.astimezone(UTC).replace(tzinfo=None)
-        until_utc = until.astimezone(UTC).replace(tzinfo=None)
 
         def fetch(start: datetime, end: datetime | None) -> list[dict[str, Any]]:
             end = end or datetime.now(UTC).replace(tzinfo=None)
@@ -536,7 +536,7 @@ class GitHubClient:
 
         prs = self._get_prs_range_cached(
             cache_key,
-            since_utc,
+            since,
             fetch,
             username,
             what="PR search (listing each repo's PRs instead)",
@@ -546,7 +546,7 @@ class GitHubClient:
         return [
             pr
             for pr in prs
-            if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) <= until_utc
+            if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) <= until
         ]
 
     def _search_prs_in_window(
@@ -701,8 +701,9 @@ class GitHubClient:
         params = {
             "sha": branch,
             "author": username,
-            "since": since.isoformat(),
-            "until": until.isoformat(),
+            # GitHub reads timestamps without a timezone as US Pacific time
+            "since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "until": until.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         return list(self._paginate(f"/repos/{repo}/commits", params))
 
@@ -756,7 +757,7 @@ class GitHubClient:
         - If cached range covers requested range, filter locally (instant)
         - If requesting older/newer data, fetch only the gap and merge
         """
-        cache_key = f"branch_commits_v2:{repo}:{branch}:{username}"
+        cache_key = f"branch_commits_v3:{repo}:{branch}:{username}"
         try:
             return self._get_branch_commits(cache_key, repo, branch, username, since, until)
         except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
@@ -779,7 +780,8 @@ class GitHubClient:
         if cached is None:
             commits = self._fetch_commits_in_range(repo, branch, username, since, until)
             self._save_commits_cache(cache_key, since, until, commits)
-            return commits
+            # GitHub filters by committer date; filter by author date like cached lookups
+            return self._filter_commits_in_range(commits, since, until)
 
         cached_since = datetime.fromisoformat(cached["cached_since"])
         cached_until = datetime.fromisoformat(cached["cached_until"])
@@ -800,13 +802,15 @@ class GitHubClient:
             )
             commits = older_commits + commits
 
-        # Fetch newer commits if needed
+        # Fetch newer commits if needed; overlap to find commits pushed after the last run
         if until > cached_until:
             newer_commits = self._fetch_commits_in_range(
-                repo, branch, username, cached_until, until
+                repo, branch, username, cached_until - COMMIT_REFRESH_OVERLAP, until
             )
             commits = commits + newer_commits
 
+        # Fetched ranges share their endpoints, so a commit there may be fetched twice
+        commits = list({commit["sha"]: commit for commit in commits}.values())
         self._save_commits_cache(cache_key, new_since, new_until, commits)
         return self._filter_commits_in_range(commits, since, until)
 
