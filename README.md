@@ -316,6 +316,10 @@ Congratulations! You've written over a million lines of code since 1y!
 │                                                       [default: direct-commits]        │
 │    --json                                             Output results as JSON for       │
 │                                                       scripting                        │
+│    --local-git           --no-local-git               Clone repos with many commits    │
+│                                                       and compute stats with git (far  │
+│                                                       fewer API requests)              │
+│                                                       [default: local-git]             │
 │    --repo            -r                         TEXT  Only process a single repository │
 │                                                       (e.g., 'owner/repo' or 'repo')   │
 │    --help            -h                               Show this message and exit.      │
