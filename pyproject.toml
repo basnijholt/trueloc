@@ -5,6 +5,20 @@ description = "Count lines of code from GitHub pull requests"
 readme = "README.md"
 authors = [{ name = "Bas Nijholt", email = "bas@nijho.lt" }]
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Version Control :: Git",
+]
 dependencies = ["typer>=0.15", "httpx>=0.28", "rich>=13", "diskcache>=5", "dateparser>=1"]
 
 [project.scripts]
