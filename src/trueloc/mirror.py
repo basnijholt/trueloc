@@ -59,18 +59,23 @@ class RepoMirrors:
         path = self.path(repo)
         url = self.url_template.format(repo=repo)
         env = self.git_env()
-        try:
-            if not path.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
                 run_git(path.parent, "clone", "-q", "--bare", "--no-tags", url, path.name, env=env)
-            elif repo not in self._synced:
-                refspec = "+refs/heads/*:refs/heads/*"
-                run_git(path, "fetch", "-q", "--prune", "--no-tags", url, refspec, env=env)
-        except subprocess.CalledProcessError as e:
-            console.print(f"[yellow]Could not clone {repo}, using the API instead: {e.stderr}[/yellow]")
-            if repo not in self._synced:
+            except subprocess.CalledProcessError as e:
+                console.print(
+                    f"[yellow]Could not clone {repo}, using the API instead: {e.stderr}[/yellow]"
+                )
                 shutil.rmtree(path, ignore_errors=True)
-            return None
+                return None
+        elif repo not in self._synced:
+            refspec = "+refs/heads/*:refs/heads/*"
+            try:
+                run_git(path, "fetch", "-q", "--prune", "--no-tags", url, refspec, env=env)
+            except subprocess.CalledProcessError as e:
+                # Keep the existing clone; commits missing from it fall back to the API
+                console.print(f"[yellow]Could not update {repo}: {e.stderr}[/yellow]")
         self._synced.add(repo)
         self._fetch_pr_heads(path, url, pr_numbers, env)
         return path

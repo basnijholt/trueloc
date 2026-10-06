@@ -45,8 +45,12 @@ def git(repo: Path, *args: str, date: str = "2024-01-10T10:00:00-08:00") -> str:
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
     }
-    result = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, env=env
+    result = subprocess.run(  # noqa: S603
+        ["git", "-C", str(repo), *args],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
     )
     return result.stdout.strip()
 
@@ -158,9 +162,7 @@ def mirrors_for(tmp_path: Path, token: str | None = None) -> RepoMirrors:
 
 
 class TestRepoMirrors:
-    def test_sync_clones_and_fetches_pr_heads(
-        self, tmp_path: Path, remote: dict[str, str]
-    ) -> None:
+    def test_sync_clones_and_fetches_pr_heads(self, tmp_path: Path, remote: dict[str, str]) -> None:
         mirrors = mirrors_for(tmp_path)
 
         path = mirrors.sync("owner/proj", pr_numbers=[1])
@@ -192,6 +194,21 @@ class TestRepoMirrors:
         assert path is not None
         assert get_pr_commits_local(path, 1, remote["squash"]) is not None
 
+    def test_failed_update_keeps_existing_clone(
+        self, tmp_path: Path, remote: dict[str, str], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A transient fetch error must not delete a clone that took long to make."""
+        import shutil
+
+        mirrors_for(tmp_path).sync("owner/proj")
+        shutil.rmtree(tmp_path / "gh")  # The remote is unreachable now
+
+        path = mirrors_for(tmp_path).sync("owner/proj")
+
+        assert path is not None
+        assert git(path, "rev-parse", "refs/heads/main") == remote["squash"]
+        assert "owner/proj" in capsys.readouterr().err
+
     def test_sync_failure_returns_none(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -199,7 +216,7 @@ class TestRepoMirrors:
         assert "owner/missing" in capsys.readouterr().err
 
     def test_token_passed_via_environment(self, tmp_path: Path) -> None:
-        env = mirrors_for(tmp_path, token="secret").git_env()
+        env = mirrors_for(tmp_path, token="secret").git_env()  # noqa: S106
 
         assert env["GIT_CONFIG_KEY_0"] == "http.extraHeader"
         # base64 of "x-access-token:secret"
@@ -227,7 +244,9 @@ def search_response(
     return httpx.Response(200, json=payload, headers={"X-RateLimit-Remaining": "5000"})
 
 
-def pr_node(number: int, repo: str = "owner/proj", merged_at: str = "2024-06-10T00:00:00Z") -> dict[str, Any]:
+def pr_node(
+    number: int, repo: str = "owner/proj", merged_at: str = "2024-06-10T00:00:00Z"
+) -> dict[str, Any]:
     return {
         "number": number,
         "title": f"PR {number}",
@@ -333,9 +352,7 @@ class TestSearchMergedPRs:
         assert route.call_count == 1
         assert prs is not None
 
-    def test_failure_returns_none(
-        self, gh_client: GitHubClient, respx_mock: respx.Router
-    ) -> None:
+    def test_failure_returns_none(self, gh_client: GitHubClient, respx_mock: respx.Router) -> None:
         """None (not []) so callers can fall back to listing PRs per repo."""
         respx_mock.post("https://api.github.com/graphql").mock(
             return_value=httpx.Response(
@@ -353,7 +370,8 @@ class TestSearchMergedPRs:
 
 @pytest.fixture
 def mirrored_client(
-    tmp_path: Path, remote: dict[str, str]
+    tmp_path: Path,
+    remote: dict[str, str],  # noqa: ARG001 (creates the repo to clone)
 ) -> Generator[GitHubClient, None, None]:
     cache = diskcache.Cache(tmp_path / "cache")
     with httpx.Client(base_url="https://api.github.com") as client:
