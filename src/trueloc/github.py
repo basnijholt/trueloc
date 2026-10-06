@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
     import diskcache  # type: ignore[import-untyped]
 
-console = Console()
+console = Console(stderr=True)  # Keep stdout clean for --json
 
 
 class GitHubClient:
@@ -144,6 +144,16 @@ class GitHubClient:
         self.cache.set(cache_key, result, expire=ttl)
         return result
 
+    def _warn_skipped(self, repo: str, what: str, error: Exception | None = None) -> None:
+        """Report a skipped API call, so missing data is not silent."""
+        if isinstance(error, httpx.HTTPStatusError) and error.response is not None:
+            reason = f" (HTTP {error.response.status_code})"
+        elif error is not None:
+            reason = f" ({type(error).__name__})"
+        else:
+            reason = ""
+        console.print(f"[yellow]Skipping {what} for {repo}{reason}[/yellow]")
+
     def get_user_repos(self, username: str) -> list[str]:
         """Get all repositories for a user."""
         cache_key = f"user_repos:{username}"
@@ -224,7 +234,11 @@ class GitHubClient:
         now = datetime.now(UTC).replace(tzinfo=None)
 
         if cached is None:
-            prs = self._fetch_prs_in_range(repo, username, since)
+            try:
+                prs = self._fetch_prs_in_range(repo, username, since)
+            except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+                self._warn_skipped(repo, "PRs", e)
+                return []
             self._save_pr_cache(cache_key, since, now, prs)
             return prs
 
@@ -237,18 +251,23 @@ class GitHubClient:
         if since >= cached_since and now - cached_until < PR_REFRESH_INTERVAL:
             return self._filter_prs_since(prs, since)
 
-        # Fetch PRs merged after the cache was written
-        if now - cached_until >= PR_REFRESH_INTERVAL:
-            # Overlap the previous fetch to tolerate clock skew; dedup by PR number below
-            newer_prs = self._fetch_prs_in_range(repo, username, cached_until - REFRESH_OVERLAP)
-            newer_numbers = {pr["number"] for pr in newer_prs}
-            prs = newer_prs + [pr for pr in prs if pr["number"] not in newer_numbers]
-            cached_until = now
+        try:
+            # Fetch PRs merged after the cache was written
+            if now - cached_until >= PR_REFRESH_INTERVAL:
+                # Overlap the previous fetch to tolerate clock skew; dedup by PR number below
+                newer_prs = self._fetch_prs_in_range(repo, username, cached_until - REFRESH_OVERLAP)
+                newer_numbers = {pr["number"] for pr in newer_prs}
+                prs = newer_prs + [pr for pr in prs if pr["number"] not in newer_numbers]
+                cached_until = now
 
-        # Requesting older data - fetch the gap and merge
-        if since < cached_since:
-            prs = prs + self._fetch_prs_in_range(repo, username, since, cached_since)
-            cached_since = since
+            # Requesting older data - fetch the gap and merge
+            if since < cached_since:
+                prs = prs + self._fetch_prs_in_range(repo, username, since, cached_since)
+                cached_since = since
+        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+            # Don't save, so the missing range is retried next run
+            self._warn_skipped(repo, "new or older PRs", e)
+            return self._filter_prs_since(prs, since)
 
         self._save_pr_cache(cache_key, cached_since, cached_until, prs)
         return self._filter_prs_since(prs, since)
@@ -333,6 +352,23 @@ class GitHubClient:
         - If requesting older/newer data, fetch only the gap and merge
         """
         cache_key = f"branch_commits_v2:{repo}:{branch}:{username}"
+        try:
+            return self._get_branch_commits(cache_key, repo, branch, username, since, until)
+        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+            # E.g. 409 for an empty repository; skip the repo instead of aborting the run
+            self._warn_skipped(repo, "direct commits", e)
+            cached = self.cache.get(cache_key)
+            return self._filter_commits_in_range(cached["commits"], since, until) if cached else []
+
+    def _get_branch_commits(  # noqa: PLR0913
+        self,
+        cache_key: str,
+        repo: str,
+        branch: str,
+        username: str,
+        since: datetime,
+        until: datetime,
+    ) -> list[dict[str, Any]]:
         cached = self.cache.get(cache_key)
 
         if cached is None:
@@ -369,14 +405,19 @@ class GitHubClient:
         self._save_commits_cache(cache_key, new_since, new_until, commits)
         return self._filter_commits_in_range(commits, since, until)
 
-    def get_pr_commits_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
-        """Get all commits in a PR (raw API response, cached forever)."""
+    def _get_pr_commits_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]] | None:
+        """Get all commits in a PR, or None if the API call failed."""
         cache_key = f"pr_commits_raw:{repo}:{pr_number}"
 
         def fetch() -> list[dict[str, Any]]:
             return list(self._paginate(f"/repos/{repo}/pulls/{pr_number}/commits"))
 
-        return self._cached_fetch(cache_key, fetch, TTL_IMMUTABLE) or []
+        result: list[dict[str, Any]] | None = self._cached_fetch(cache_key, fetch, TTL_IMMUTABLE)
+        return result
+
+    def get_pr_commits_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
+        """Get all commits in a PR (raw API response, cached forever)."""
+        return self._get_pr_commits_raw(repo, pr_number) or []
 
     def get_pr_commits(self, repo: str, pr_number: int) -> list[str]:
         """Get all commit SHAs in a PR."""
@@ -401,7 +442,13 @@ class GitHubClient:
         return data
 
     def get_commit_stats(self, repo: str, sha: str) -> tuple[int, int, dict[str, FileStats]]:
-        """Get additions and deletions for a single commit.
+        """Get additions and deletions for a single commit (zeros if the API call failed)."""
+        return self._get_commit_stats(repo, sha) or (0, 0, {})
+
+    def _get_commit_stats(
+        self, repo: str, sha: str
+    ) -> tuple[int, int, dict[str, FileStats]] | None:
+        """Get additions and deletions for a single commit, or None if the API call failed.
 
         Uses cached raw commit data, also caches processed stats for speed.
         """
@@ -416,7 +463,7 @@ class GitHubClient:
         # Get raw data (cached separately for flexibility)
         raw = self.get_commit_raw(repo, sha)
         if raw is None:
-            return 0, 0, {}
+            return None
 
         # Extract and cache processed stats
         result = self._extract_file_stats(raw.get("files", []))
@@ -424,24 +471,18 @@ class GitHubClient:
         self.cache.set(stats_cache_key, (result[0], result[1], ext_data), expire=TTL_IMMUTABLE)
         return result
 
-    def get_pr_files_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]]:
-        """Get all files changed in a PR (raw API response, cached forever)."""
+    def get_pr_files_raw(self, repo: str, pr_number: int) -> list[dict[str, Any]] | None:
+        """Get all files changed in a PR (raw API response, cached forever).
+
+        Returns None if the API call failed, so the failure is not cached.
+        """
         cache_key = f"pr_files_raw:{repo}:{pr_number}"
 
-        cached = self.cache.get(cache_key)
-        if cached is not None:
-            result: list[dict[str, Any]] = cached
-            return result
+        def fetch() -> list[dict[str, Any]]:
+            return list(self._paginate(f"/repos/{repo}/pulls/{pr_number}/files"))
 
-        try:
-            files: list[dict[str, Any]] = list(
-                self._paginate(f"/repos/{repo}/pulls/{pr_number}/files")
-            )
-        except (httpx.HTTPStatusError, httpx.TimeoutException):
-            files = []
-
-        self.cache.set(cache_key, files, expire=TTL_IMMUTABLE)
-        return files
+        result: list[dict[str, Any]] | None = self._cached_fetch(cache_key, fetch, TTL_IMMUTABLE)
+        return result
 
     def get_pr_stats_per_commit(
         self, repo: str, pr_number: int
@@ -459,16 +500,26 @@ class GitHubClient:
         total_additions = 0
         total_deletions = 0
 
-        for sha in self.get_pr_commits(repo, pr_number):
-            add, del_, ext_stats = self.get_commit_stats(repo, sha)
+        commits = self._get_pr_commits_raw(repo, pr_number)
+        complete = commits is not None
+        for commit in commits or []:
+            commit_stats = self._get_commit_stats(repo, commit["sha"])
+            if commit_stats is None:
+                complete = False
+                continue
+            add, del_, ext_stats = commit_stats
             total_additions += add
             total_deletions += del_
             for ext, stats in ext_stats.items():
                 by_extension[ext].additions += stats.additions
                 by_extension[ext].deletions += stats.deletions
 
-        ext_data = {ext: stats.to_tuple() for ext, stats in by_extension.items()}
-        self.cache.set(cache_key, (total_additions, total_deletions, ext_data))
+        # Only cache complete results, so failed API calls are retried next run
+        if not complete:
+            self._warn_skipped(repo, f"some commits of PR #{pr_number}")
+        else:
+            ext_data = {ext: stats.to_tuple() for ext, stats in by_extension.items()}
+            self.cache.set(cache_key, (total_additions, total_deletions, ext_data))
         return total_additions, total_deletions, dict(by_extension)
 
     def get_pr_stats_net(self, repo: str, pr_number: int) -> tuple[int, int, dict[str, FileStats]]:
@@ -486,6 +537,9 @@ class GitHubClient:
 
         # Get raw files (cached separately for flexibility)
         files = self.get_pr_files_raw(repo, pr_number)
+        if files is None:
+            self._warn_skipped(repo, f"files of PR #{pr_number}")
+            return 0, 0, {}
 
         # Extract and cache processed stats
         result = self._extract_file_stats(files)
