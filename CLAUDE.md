@@ -24,10 +24,10 @@ Cache lives at `~/.cache/trueloc/` using diskcache with SQLite backend.
 - `pr_stats_per_commit:{repo}:{pr_number}` - Per-commit PR stats (immutable)
 - `pr_stats_net:{repo}:{pr_number}` - Net diff PR stats (immutable)
 - `commit_stats:{repo}:{sha}` - Individual commit stats (immutable)
-- `merged_prs_v2:{repo}:{author}` - Merged PRs with `cached_since` watermark
+- `merged_prs_v2:{repo}:{author}` - Merged PRs with `cached_since`/`cached_until` watermarks
 - `branch_commits_v2:{repo}:{branch}:{author}` - Branch commits with range-aware caching
 
-The `v2` keys use range-aware caching: they store a `cached_since` timestamp and only fetch newer data on subsequent calls.
+The `v2` keys use range-aware caching: they store `cached_since`/`cached_until` timestamps and only fetch the missing ranges on subsequent calls. Merged PRs are re-checked for newly merged ones once `cached_until` is older than `PR_REFRESH_INTERVAL` (1 hour).
 
 ### GitHub API Flow
 

@@ -726,6 +726,43 @@ class TestGitHubClientPRCaching:
             assert {pr["number"] for pr in prs} == {1, 2}
             assert route.call_count == 1
 
+    def test_get_merged_prs_refreshes_legacy_cache_and_dedups(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """Entries without cached_until are refreshed from cached_since, deduped by number."""
+        cache_key = "merged_prs_v2:user/repo:testuser"
+        pr1 = {"number": 1, "merged_at": "2024-01-10T10:00:00Z", "user": {"login": "testuser"}}
+        memory_cache.set(cache_key, {"cached_since": "2024-01-08T00:00:00", "prs": [pr1]})
+        refreshed_pr1 = {**pr1, "title": "refreshed", "updated_at": "2024-01-12T10:00:00Z"}
+        pr2 = {
+            "number": 2,
+            "merged_at": "2024-02-01T10:00:00Z",
+            "updated_at": "2024-02-01T10:00:00Z",
+            "user": {"login": "testuser"},
+        }
+        old = {
+            "number": 0,
+            "merged_at": "2024-01-01T10:00:00Z",
+            "updated_at": "2024-01-01T10:00:00Z",
+            "user": {"login": "testuser"},
+        }
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200, json=[pr2, refreshed_pr1, old], headers={"X-RateLimit-Remaining": "5000"}
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+            prs = gh.get_merged_prs("user/repo", "testuser", datetime(2024, 1, 8))
+
+        assert sorted(pr["number"] for pr in prs) == [1, 2]
+        assert next(pr for pr in prs if pr["number"] == 1)["title"] == "refreshed"
+        assert "cached_until" in memory_cache.get(cache_key)
+
     def test_fetch_prs_stops_at_prs_updated_before_since(
         self, gh_client: GitHubClient, respx_mock: respx.Router
     ) -> None:

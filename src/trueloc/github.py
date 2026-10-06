@@ -15,6 +15,7 @@ from trueloc.models import FileStats
 from trueloc.utils import (
     PR_REFRESH_INTERVAL,
     RATE_LIMIT_BUFFER,
+    REFRESH_OVERLAP,
     TTL_IMMUTABLE,
     TTL_MUTABLE,
     get_file_extension,
@@ -196,7 +197,8 @@ class GitHubClient:
     ) -> None:
         """Save PRs to cache with the given watermark dates.
 
-        Uses TTL_IMMUTABLE since range-aware caching handles new PRs by fetching gaps.
+        Uses TTL_IMMUTABLE since range-aware caching fetches PRs merged after `until`
+        (once older than PR_REFRESH_INTERVAL) and older gaps before `since`.
         """
         self.cache.set(
             cache_key,
@@ -237,7 +239,8 @@ class GitHubClient:
 
         # Fetch PRs merged after the cache was written
         if now - cached_until >= PR_REFRESH_INTERVAL:
-            newer_prs = self._fetch_prs_in_range(repo, username, cached_until)
+            # Overlap the previous fetch to tolerate clock skew; dedup by PR number below
+            newer_prs = self._fetch_prs_in_range(repo, username, cached_until - REFRESH_OVERLAP)
             newer_numbers = {pr["number"] for pr in newer_prs}
             prs = newer_prs + [pr for pr in prs if pr["number"] not in newer_numbers]
             cached_until = now

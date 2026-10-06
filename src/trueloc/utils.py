@@ -19,6 +19,7 @@ CACHE_DIR = Path.home() / ".cache" / "trueloc"
 TTL_MUTABLE = 604800  # 7 days for mutable data
 TTL_IMMUTABLE = None  # Never expires for immutable data
 PR_REFRESH_INTERVAL = timedelta(hours=1)  # Re-check for newly merged PRs after this
+REFRESH_OVERLAP = timedelta(minutes=10)  # Re-fetch this far before the last refresh
 RATE_LIMIT_BUFFER = 500  # Proactively pause when remaining requests drop below this
 
 
