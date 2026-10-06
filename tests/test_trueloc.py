@@ -1515,6 +1515,41 @@ class TestGitHubClientPRStatsPerCommit:
         assert dels == 5
         assert by_ext[".py"].additions == 10
 
+    def test_get_pr_stats_per_commit_skips_merge_commits(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """Merging the base branch into a PR branch brings in others' changes, not new work."""
+        headers = {"X-RateLimit-Remaining": "5000"}
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/123/commits",
+            params={"per_page": "100", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"sha": "work", "parents": [{"sha": "a"}]},
+                    {"sha": "merge", "parents": [{"sha": "work"}, {"sha": "main"}]},
+                ],
+                headers=headers,
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/123/commits",
+            params={"per_page": "100", "page": "2"},
+        ).mock(return_value=httpx.Response(200, json=[], headers=headers))
+        # No route for the merge commit: fetching it would fail the test
+        respx_mock.get("https://api.github.com/repos/user/repo/commits/work").mock(
+            return_value=httpx.Response(
+                200,
+                json={"files": [{"filename": "a.py", "additions": 10, "deletions": 5}]},
+                headers=headers,
+            )
+        )
+
+        adds, dels, _ = gh_client.get_pr_stats_per_commit("user/repo", 123)
+
+        assert (adds, dels) == (10, 5)
+
 
 class TestGitHubClientPRStatsNet:
     """Tests for PR stats net diff."""
@@ -1616,7 +1651,7 @@ class TestGitHubClientFailures:
         ).mock(return_value=httpx.Response(500, headers=self.HEADERS))
 
         assert gh_client.get_pr_stats_per_commit("user/repo", 1)[:2] == (0, 0)
-        assert "pr_stats_per_commit:user/repo:1" not in gh_client.cache
+        assert "pr_stats_per_commit_v2:user/repo:1" not in gh_client.cache
 
     def test_branch_commits_error_skips_repo(
         self, gh_client: GitHubClient, respx_mock: respx.Router

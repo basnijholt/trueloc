@@ -57,7 +57,7 @@ def _process_pr(  # noqa: PLR0913
 ) -> None:
     """Process a single PR and update aggregator."""
     get_stats = gh.get_pr_stats_per_commit if per_commit else gh.get_pr_stats_net
-    cache_prefix = "pr_stats_per_commit" if per_commit else "pr_stats_net"
+    cache_prefix = "pr_stats_per_commit_v2" if per_commit else "pr_stats_net"
 
     cache_key = f"{cache_prefix}:{repo}:{pr['number']}"
     was_cached = cache_key in gh.cache

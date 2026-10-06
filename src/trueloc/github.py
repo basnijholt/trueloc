@@ -638,7 +638,8 @@ class GitHubClient:
         self, repo: str, pr_number: int
     ) -> tuple[int, int, dict[str, FileStats]]:
         """Get total additions/deletions across all commits in a PR."""
-        cache_key = f"pr_stats_per_commit:{repo}:{pr_number}"
+        # v2: merge commits are skipped (v1 cached totals that included them)
+        cache_key = f"pr_stats_per_commit_v2:{repo}:{pr_number}"
 
         cached = self.cache.get(cache_key)
         if cached is not None:
@@ -653,6 +654,9 @@ class GitHubClient:
         commits = self._get_pr_commits_raw(repo, pr_number)
         complete = commits is not None
         for commit in commits or []:
+            # Merging the base branch into the PR branch brings in others' changes
+            if len(commit.get("parents", [])) > 1:
+                continue
             commit_stats = self._get_commit_stats(repo, commit["sha"])
             if commit_stats is None:
                 complete = False
