@@ -21,16 +21,31 @@ def run_git(
     stdin: str | None = None,
     env: dict[str, str] | None = None,
 ) -> str:
-    """Run a git command in the specified repository."""
+    """Run a git command in the specified repository.
+
+    Output that isn't valid UTF-8 (e.g. Latin-1 file names) is decoded with replacements.
+    """
+    cmd = ["git", "-C", str(repo_path), *args]
     result = subprocess.run(  # noqa: S603
-        ["git", "-C", str(repo_path), *args],  # noqa: S607
+        cmd,
         capture_output=True,
-        text=True,
-        check=True,
-        input=stdin,
+        check=False,
+        input=None if stdin is None else stdin.encode(),
         env=env,
     )
-    return result.stdout
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        raise subprocess.CalledProcessError(result.returncode, cmd, stdout, stderr)
+    return stdout
+
+
+def _isolated_env(**extra: str) -> dict[str, str]:
+    """Environment ignoring the user's git config (e.g. log.showSignature, log.showRoot).
+
+    For read-only commands whose output is parsed.
+    """
+    return {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", **extra}
 
 
 def get_local_commits(
@@ -167,6 +182,7 @@ def get_commits_numstat(
         "--no-textconv",
         "--format=%x01%H",
         stdin="\n".join(shas),
+        env=_isolated_env(),
     )
     return parse_numstat_z(output)
 
@@ -180,6 +196,7 @@ def get_existing_commits(repo_path: Path, shas: list[str]) -> set[str]:
         "cat-file",
         "--batch-check=%(objectname) %(objecttype)",
         stdin="\n".join(shas),
+        env=_isolated_env(),
     )
     return {line.split()[0] for line in output.splitlines() if line.endswith(" commit")}
 
@@ -204,7 +221,7 @@ def get_pr_commits_local(
             f"refs/pull/{pr_number}/head",
             "--not",
             f"{merge_commit_sha}^1",
-            env={**os.environ, "TZ": "UTC"},
+            env=_isolated_env(TZ="UTC"),
         )
     except subprocess.CalledProcessError:
         return None
@@ -218,7 +235,8 @@ def get_pr_commits_local(
             {
                 "sha": sha,
                 "parents": [{"sha": parent} for parent in parents.split()],
-                "commit": {"author": {"date": date}, "message": message.rstrip("\n")},
+                # GitHub strips trailing whitespace from messages
+                "commit": {"author": {"date": date}, "message": message.rstrip()},
             }
         )
     return commits

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import shutil
 import subprocess
 from typing import TYPE_CHECKING
@@ -19,6 +20,24 @@ if TYPE_CHECKING:
 console = Console(stderr=True)  # Keep stdout clean for --json
 
 FETCH_CHUNK_SIZE = 500  # PR refs per git fetch, keeping command lines short
+MIN_GIT_VERSION = (2, 31)  # For GIT_CONFIG_COUNT, used to pass the token
+
+
+def git_supports_env_config() -> bool:
+    """Whether git is installed and new enough to read config from the environment."""
+    if shutil.which("git") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "--version"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    match = re.search(r"(\d+)\.(\d+)", result.stdout)
+    return match is not None and (int(match[1]), int(match[2])) >= MIN_GIT_VERSION
 
 
 class RepoMirrors:
@@ -34,6 +53,7 @@ class RepoMirrors:
         self.token = token
         self.url_template = url_template
         self._synced: set[str] = set()
+        self._unreachable: set[str] = set()
 
     def path(self, repo: str) -> Path:
         """Local path of the bare clone of a repo."""
@@ -46,7 +66,8 @@ class RepoMirrors:
             credentials = base64.b64encode(f"x-access-token:{self.token}".encode()).decode()
             env |= {
                 "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "http.extraHeader",
+                # Scoped to GitHub, so URL rewrites to other hosts don't receive the token
+                "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
                 "GIT_CONFIG_VALUE_0": f"Authorization: Basic {credentials}",
             }
         return env
@@ -76,8 +97,10 @@ class RepoMirrors:
             except subprocess.CalledProcessError as e:
                 # Keep the existing clone; commits missing from it fall back to the API
                 console.print(f"[yellow]Could not update {repo}: {e.stderr}[/yellow]")
+                self._unreachable.add(repo)
         self._synced.add(repo)
-        self._fetch_pr_heads(path, url, pr_numbers, env)
+        if repo not in self._unreachable:
+            self._fetch_pr_heads(path, url, pr_numbers, env)
         return path
 
     def _fetch_pr_heads(
@@ -91,13 +114,16 @@ class RepoMirrors:
             if f"refs/pull/{n}/head" not in present
         ]
         for i in range(0, len(refspecs), FETCH_CHUNK_SIZE):
-            chunk = refspecs[i : i + FETCH_CHUNK_SIZE]
-            try:
-                run_git(path, "fetch", "-q", "--no-tags", url, *chunk, env=env)
-            except subprocess.CalledProcessError:
-                # One missing ref fails the whole fetch; fetch the chunk one by one
-                for refspec in chunk:
-                    try:
-                        run_git(path, "fetch", "-q", "--no-tags", url, refspec, env=env)
-                    except subprocess.CalledProcessError:
-                        continue
+            self._fetch_refspecs(path, url, refspecs[i : i + FETCH_CHUNK_SIZE], env)
+
+    def _fetch_refspecs(
+        self, path: Path, url: str, refspecs: list[str], env: dict[str, str]
+    ) -> None:
+        """Fetch refspecs; one missing ref fails a fetch, so split failed fetches in half."""
+        try:
+            run_git(path, "fetch", "-q", "--no-tags", url, *refspecs, env=env)
+        except subprocess.CalledProcessError:
+            if len(refspecs) > 1:
+                middle = len(refspecs) // 2
+                self._fetch_refspecs(path, url, refspecs[:middle], env)
+                self._fetch_refspecs(path, url, refspecs[middle:], env)

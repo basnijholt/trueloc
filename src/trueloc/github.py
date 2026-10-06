@@ -84,6 +84,17 @@ def _pr_key(pr: dict[str, Any]) -> tuple[str | None, int]:
     return pr.get("repo"), pr["number"]
 
 
+def _dedupe_prs(prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop repeated PRs, keeping the first."""
+    seen = set()
+    result = []
+    for pr in prs:
+        if _pr_key(pr) not in seen:
+            seen.add(_pr_key(pr))
+            result.append(pr)
+    return result
+
+
 def _search_node_to_pr(node: dict[str, Any]) -> dict[str, Any]:
     """Convert a GraphQL search node to the REST-shaped PR fields used elsewhere."""
     return {
@@ -95,7 +106,7 @@ def _search_node_to_pr(node: dict[str, Any]) -> dict[str, Any]:
         "user": {"login": (node["author"] or {}).get("login", "")},
         "repo": node["repository"]["nameWithOwner"],
         "commit_count": node["commits"]["totalCount"],
-        "disk_usage": node["repository"]["diskUsage"],
+        "disk_usage": node["repository"]["diskUsage"] or 0,
     }
 
 
@@ -451,6 +462,7 @@ class GitHubClient:
         since: datetime,
         fetch: Callable[[datetime, datetime | None], list[dict[str, Any]]],
         label: str,
+        what: str = "PRs",
     ) -> list[dict[str, Any]] | None:
         """Get merged PRs since a date with range-aware caching.
 
@@ -464,7 +476,7 @@ class GitHubClient:
             try:
                 prs = fetch(since, None)
             except (httpx.HTTPStatusError, httpx.TimeoutException, GraphQLError) as e:
-                self._warn_skipped(label, "PRs", e)
+                self._warn_skipped(label, what, e)
                 return None
             self._save_pr_cache(cache_key, since, now, prs)
             return prs
@@ -489,7 +501,8 @@ class GitHubClient:
 
             # Requesting older data - fetch the gap and merge
             if since < cached_since:
-                prs = prs + fetch(since, cached_since)
+                # Ranges may share an endpoint, so dedupe
+                prs = _dedupe_prs(prs + fetch(since, cached_since))
                 cached_since = since
         except (httpx.HTTPStatusError, httpx.TimeoutException, GraphQLError) as e:
             # Don't save, so the missing range is retried next run
@@ -521,7 +534,13 @@ class GitHubClient:
             end = end or datetime.now(UTC).replace(tzinfo=None)
             return self._search_prs_in_window(username, start, end, repo)
 
-        prs = self._get_prs_range_cached(cache_key, since_utc, fetch, username)
+        prs = self._get_prs_range_cached(
+            cache_key,
+            since_utc,
+            fetch,
+            username,
+            what="PR search (listing each repo's PRs instead)",
+        )
         if prs is None:
             return None
         return [
@@ -550,9 +569,11 @@ class GitHubClient:
             too_many = cursor is None and search["issueCount"] > MAX_SEARCH_RESULTS
             if too_many and end - start > timedelta(minutes=1):
                 middle = start + (end - start) / 2
-                return self._search_prs_in_window(
-                    username, start, middle, repo
-                ) + self._search_prs_in_window(username, middle, end, repo)
+                # `merged:A..B` includes both ends, so a PR at `middle` is in both halves
+                return _dedupe_prs(
+                    self._search_prs_in_window(username, start, middle, repo)
+                    + self._search_prs_in_window(username, middle, end, repo)
+                )
             prs.extend(_search_node_to_pr(node) for node in search["nodes"] if node)
             if not search["pageInfo"]["hasNextPage"]:
                 return prs

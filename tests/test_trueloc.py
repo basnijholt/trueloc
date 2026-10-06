@@ -2072,6 +2072,103 @@ class TestCLI:
         summary = json.loads(result.stdout)["summary"]
         assert summary["total_additions"] == 10
 
+    def test_count_single_repo_counts_direct_commits_once(self, respx_mock: respx.Router) -> None:
+        """Search returns GitHub's capitalization of the repo name; `--repo` may differ."""
+        from typer.testing import CliRunner
+
+        from trueloc.cli import app
+
+        headers = {"X-RateLimit-Remaining": "5000"}
+
+        def ok(data: Any) -> httpx.Response:
+            return httpx.Response(200, json=data, headers=headers)
+
+        node = {
+            "number": 1,
+            "title": "PR",
+            "mergedAt": "2024-06-10T00:00:00Z",
+            "updatedAt": "2024-06-10T00:00:00Z",
+            "author": {"login": "testuser"},
+            "mergeCommit": {"oid": "squash"},
+            "repository": {"nameWithOwner": "testuser/repo", "diskUsage": 10},
+            "commits": {"totalCount": 0},
+        }
+        search = {"issueCount": 1, "pageInfo": {"hasNextPage": False}, "nodes": [node]}
+        respx_mock.post("https://api.github.com/graphql").mock(
+            return_value=ok({"data": {"search": search}})
+        )
+        url = "https://api.github.com/repos/testuser/repo/pulls/1/commits"
+        respx_mock.get(url).mock(return_value=ok([]))
+        # Only the name as typed is mocked: scanning both spellings would fail the test
+        respx_mock.get("https://api.github.com/repos/TestUser/Repo").mock(
+            return_value=ok({"default_branch": "main", "size": 10})
+        )
+        commit = {
+            "sha": "direct",
+            "parents": [{"sha": "p"}],
+            "commit": {"author": {"date": "2024-06-10T00:00:00Z"}, "message": "Work"},
+        }
+        url = "https://api.github.com/repos/TestUser/Repo/commits"
+        respx_mock.get(url, params__contains={"page": "1"}).mock(return_value=ok([commit]))
+        respx_mock.get(url, params__contains={"page": "2"}).mock(return_value=ok([]))
+        respx_mock.get("https://api.github.com/repos/TestUser/Repo/commits/direct").mock(
+            return_value=ok({"files": [{"filename": "a.py", "additions": 5, "deletions": 0}]})
+        )
+
+        with patch("trueloc.cli.get_github_token", return_value="token"):
+            result = CliRunner().invoke(
+                app,
+                [
+                    "count",
+                    "testuser",
+                    "--since",
+                    "2024-01-01",
+                    "--until",
+                    "2024-12-31",
+                    "--repo",
+                    "TestUser/Repo",
+                    "--no-local-git",
+                    "--json",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["summary"]["total_additions"] == 5
+
+    def test_no_cache_disables_local_git(self, respx_mock: respx.Router) -> None:
+        """--no-cache would re-clone every repo on every run."""
+        from typer.testing import CliRunner
+
+        from trueloc.cli import app
+
+        headers = {"X-RateLimit-Remaining": "5000"}
+        search = {"issueCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []}
+        respx_mock.post("https://api.github.com/graphql").mock(
+            return_value=httpx.Response(200, json={"data": {"search": search}}, headers=headers)
+        )
+        respx_mock.get("https://api.github.com/repos/testuser/repo").mock(
+            return_value=httpx.Response(200, json={"default_branch": "main"}, headers=headers)
+        )
+        respx_mock.get("https://api.github.com/repos/testuser/repo/commits").mock(
+            return_value=httpx.Response(200, json=[], headers=headers)
+        )
+
+        with (
+            patch("trueloc.cli.get_github_token", return_value="token"),
+            patch("trueloc.cli.RepoMirrors", side_effect=AssertionError("cloned")),
+        ):
+            result = CliRunner().invoke(
+                app, ["count", "testuser", "--since", "1m", "--repo", "repo", "--no-cache"]
+            )
+
+        assert result.exit_code == 0, result.output
+
+    def test_tracebacks_hide_local_variables(self) -> None:
+        """Rich tracebacks with locals would print the GitHub token on a crash."""
+        from trueloc.cli import app
+
+        assert app.pretty_exceptions_show_locals is False
+
     def test_cache_isolation_fixture(self) -> None:
         """Verify the global _isolate_cache fixture is working."""
         from trueloc import cli, utils

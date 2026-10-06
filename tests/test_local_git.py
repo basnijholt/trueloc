@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
@@ -14,12 +16,11 @@ import httpx
 import pytest
 
 from trueloc.github import GitHubClient
-from trueloc.local import get_commits_numstat, get_pr_commits_local, parse_numstat_z
-from trueloc.mirror import RepoMirrors
+from trueloc.local import get_commits_numstat, get_pr_commits_local, parse_numstat_z, run_git
+from trueloc.mirror import RepoMirrors, git_supports_env_config
 
 if TYPE_CHECKING:
     from collections.abc import Generator
-    from pathlib import Path
 
     import respx
 
@@ -32,7 +33,9 @@ def gh_client(tmp_path: Path) -> Generator[GitHubClient, None, None]:
     cache.close()
 
 
-def git(repo: Path, *args: str, date: str = "2024-01-10T10:00:00-08:00") -> str:
+def git(
+    repo: Path, *args: str, date: str = "2024-01-10T10:00:00-08:00", stdin: bytes | None = None
+) -> str:
     env = {
         **os.environ,
         "GIT_AUTHOR_NAME": "Test",
@@ -48,11 +51,11 @@ def git(repo: Path, *args: str, date: str = "2024-01-10T10:00:00-08:00") -> str:
     result = subprocess.run(  # noqa: S603
         ["git", "-C", str(repo), *args],  # noqa: S607
         capture_output=True,
-        text=True,
         check=True,
         env=env,
+        input=stdin,
     )
-    return result.stdout.strip()
+    return result.stdout.decode().strip()
 
 
 @pytest.fixture
@@ -127,8 +130,6 @@ class TestParseNumstatZ:
 
 class TestLocalGit:
     def test_get_commits_numstat(self, remote: dict[str, str]) -> None:
-        from pathlib import Path
-
         stats = get_commits_numstat(Path(remote["path"]), [remote["c1"], remote["c2"]])
 
         assert stats[remote["c1"]][:2] == (3, 0)
@@ -136,8 +137,6 @@ class TestLocalGit:
         assert stats[remote["c2"]][2][".py"].to_tuple() == (1, 0)
 
     def test_get_pr_commits_local_matches_rest_shape(self, remote: dict[str, str]) -> None:
-        from pathlib import Path
-
         commits = get_pr_commits_local(Path(remote["path"]), 1, remote["squash"])
 
         assert commits is not None
@@ -151,9 +150,87 @@ class TestLocalGit:
         assert len(first["parents"]) == 1
         assert len(commits[2]["parents"]) == 2
 
-    def test_get_pr_commits_local_missing_ref(self, remote: dict[str, str]) -> None:
-        from pathlib import Path
+    def test_rebase_merged_pr(self, remote: dict[str, str]) -> None:
+        """Rebase merges copy PR commits to the base branch with new SHAs."""
+        repo = Path(remote["path"])
+        git(repo, "switch", "-q", "-c", "rebased", f"{remote['squash']}^")
+        git(repo, "cherry-pick", remote["c1"], remote["c2"], date="2024-02-01T00:00:00Z")
+        last_copy = git(repo, "rev-parse", "HEAD")
+        git(repo, "update-ref", "refs/pull/2/head", remote["c2"])
+        # The two copies: commits on the rebased branch after its base
+        git(repo, "update-ref", "refs/pull/9/head", last_copy)
+        copies = get_pr_commits_local(repo, 9, f"{last_copy}^")
 
+        commits = get_pr_commits_local(repo, 2, last_copy)
+
+        assert commits is not None
+        assert [c["sha"] for c in commits] == [remote["c1"], remote["c2"]]
+        # The copies keep author date and message, which the direct-commit dedup relies on
+        assert copies is not None
+        fingerprint = [(c["commit"]["author"]["date"], c["commit"]["message"]) for c in commits]
+        assert fingerprint == [
+            (c["commit"]["author"]["date"], c["commit"]["message"]) for c in copies
+        ]
+        assert {c["sha"] for c in copies}.isdisjoint({remote["c1"], remote["c2"]})
+
+    def test_merge_commit_merged_pr(self, remote: dict[str, str]) -> None:
+        repo = Path(remote["path"])
+        git(repo, "switch", "-q", "-c", "merged", f"{remote['squash']}^")
+        git(repo, "update-ref", "refs/pull/3/head", remote["c2"])
+        git(repo, "merge", "-q", "--no-ff", "--no-edit", remote["c2"])
+        merge = git(repo, "rev-parse", "HEAD")
+
+        commits = get_pr_commits_local(repo, 3, merge)
+
+        assert commits is not None
+        assert [c["sha"] for c in commits] == [remote["c1"], remote["c2"]]
+
+    def test_crlf_message_and_non_utf8_path(self, remote: dict[str, str]) -> None:
+        """Bytes that aren't UTF-8 must not crash, and messages must match REST."""
+        repo = Path(remote["path"])
+        blob = git(repo, "hash-object", "-w", "--stdin", stdin=b"1\n2\n")
+        git(
+            repo,
+            "update-index",
+            "--index-info",
+            stdin=f"100644 {blob}\t".encode() + b"caf\xe9.py\n",
+        )
+        message = repo / "message.txt"
+        message.write_bytes(b"Fix\r\n\r\nBody  \r\n")
+        git(repo, "commit", "-q", "--cleanup=verbatim", "-F", str(message))
+        sha = git(repo, "rev-parse", "HEAD")
+        git(repo, "update-ref", "refs/pull/4/head", sha)
+
+        stats = get_commits_numstat(repo, [sha])
+        commits = get_pr_commits_local(repo, 4, remote["squash"])
+
+        assert stats[sha][2][".py"].to_tuple() == (2, 0)
+        assert commits is not None
+        # GitHub keeps CRLF inside messages but strips trailing whitespace
+        assert commits[-1]["commit"]["message"] == "Fix\r\n\r\nBody"
+
+    def test_ignores_user_git_config(
+        self, tmp_path: Path, remote: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Settings like log.showSignature or log.showRoot=false must not change results."""
+        config = tmp_path / "gitconfig"
+        config.write_text(
+            "[log]\n\tshowSignature = true\n\tshowRoot = false\n"
+            "[diff]\n\trenames = copies\n[color]\n\tui = always\n"
+        )
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+        repo = Path(remote["path"])
+        root = git(repo, "rev-list", "--max-parents=0", "HEAD")
+
+        stats = get_commits_numstat(repo, [root, remote["c1"]])
+        commits = get_pr_commits_local(repo, 1, remote["squash"])
+
+        assert stats[root][:2] == (1, 0)
+        assert stats[remote["c1"]][:2] == (3, 0)
+        assert commits is not None
+        assert [c["sha"] for c in commits] == [remote["c1"], remote["c2"], remote["merge"]]
+
+    def test_get_pr_commits_local_missing_ref(self, remote: dict[str, str]) -> None:
         assert get_pr_commits_local(Path(remote["path"]), 2, remote["squash"]) is None
 
 
@@ -173,8 +250,6 @@ class TestRepoMirrors:
         assert git(path, "rev-parse", "refs/heads/main") == remote["squash"]
 
     def test_sync_fetches_new_commits(self, tmp_path: Path, remote: dict[str, str]) -> None:
-        from pathlib import Path
-
         mirrors_for(tmp_path).sync("owner/proj")
         repo = Path(remote["path"])
         (repo / "e.py").write_text("e\n")
@@ -198,8 +273,6 @@ class TestRepoMirrors:
         self, tmp_path: Path, remote: dict[str, str], capsys: pytest.CaptureFixture[str]
     ) -> None:
         """A transient fetch error must not delete a clone that took long to make."""
-        import shutil
-
         mirrors_for(tmp_path).sync("owner/proj")
         shutil.rmtree(tmp_path / "gh")  # The remote is unreachable now
 
@@ -209,16 +282,44 @@ class TestRepoMirrors:
         assert git(path, "rev-parse", "refs/heads/main") == remote["squash"]
         assert "owner/proj" in capsys.readouterr().err
 
+    @pytest.mark.usefixtures("remote")
+    def test_failed_update_skips_pr_heads(self, tmp_path: Path) -> None:
+        """Fetching PR heads one by one from an unreachable remote would take minutes."""
+        mirrors_for(tmp_path).sync("owner/proj")
+        shutil.rmtree(tmp_path / "gh")
+        fetches = []
+
+        def counting_run_git(*args: Any, **kwargs: Any) -> str:
+            if "fetch" in args:
+                fetches.append(args)
+            return run_git(*args, **kwargs)
+
+        with patch("trueloc.mirror.run_git", counting_run_git):
+            mirrors_for(tmp_path).sync("owner/proj", pr_numbers=range(2, 50))
+
+        assert len(fetches) == 1  # Only the failed branch update
+
     def test_sync_failure_returns_none(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         assert mirrors_for(tmp_path).sync("owner/missing") is None
         assert "owner/missing" in capsys.readouterr().err
 
+    @pytest.mark.parametrize(
+        ("version", "supported"),
+        [("git version 2.30.9", False), ("git version 2.31.0", True), ("git version 2.55.0", True)],
+    )
+    def test_git_supports_env_config(self, version: str, supported: bool) -> None:  # noqa: FBT001
+        """GIT_CONFIG_COUNT, used to pass the token, needs git 2.31."""
+        completed = subprocess.CompletedProcess([], 0, stdout=version)
+        with patch("trueloc.mirror.subprocess.run", return_value=completed):
+            assert git_supports_env_config() is supported
+
     def test_token_passed_via_environment(self, tmp_path: Path) -> None:
         env = mirrors_for(tmp_path, token="secret").git_env()  # noqa: S106
 
-        assert env["GIT_CONFIG_KEY_0"] == "http.extraHeader"
+        # Scoped to GitHub, so URL rewrites to other hosts can't receive the token
+        assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
         # base64 of "x-access-token:secret"
         assert env["GIT_CONFIG_VALUE_0"] == "Authorization: Basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0"
         assert env["GIT_TERMINAL_PROMPT"] == "0"
@@ -337,6 +438,33 @@ class TestSearchMergedPRs:
         whole, first, second = (v["q"].split("merged:")[1] for v in graphql_variables(route))
         assert first.split("..")[0] == whole.split("..")[0]
         assert first.split("..")[1] == second.split("..")[0]
+
+    def test_dedupes_prs_at_window_edges(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """`merged:A..B` includes both ends, so a PR at a split point is found twice."""
+        respx_mock.post("https://api.github.com/graphql").mock(
+            side_effect=[
+                search_response([], issue_count=1500),
+                search_response([pr_node(1)]),
+                search_response([pr_node(1)]),
+            ]
+        )
+
+        prs = gh_client.search_merged_prs("testuser", datetime(2024, 6, 1), datetime(2024, 7, 1))
+
+        assert prs is not None
+        assert [pr["number"] for pr in prs] == [1]
+
+    def test_null_disk_usage(self, gh_client: GitHubClient, respx_mock: respx.Router) -> None:
+        node = pr_node(1)
+        node["repository"]["diskUsage"] = None
+        respx_mock.post("https://api.github.com/graphql").mock(return_value=search_response([node]))
+
+        prs = gh_client.search_merged_prs("testuser", datetime(2024, 6, 1), datetime(2024, 7, 1))
+
+        assert prs is not None
+        assert prs[0]["disk_usage"] == 0
 
     def test_cached_within_refresh_interval(
         self, gh_client: GitHubClient, respx_mock: respx.Router

@@ -32,7 +32,7 @@ from trueloc.display import (
 )
 from trueloc.github import GitHubClient
 from trueloc.local import get_commit_numstat, get_local_commits
-from trueloc.mirror import RepoMirrors
+from trueloc.mirror import RepoMirrors, git_supports_env_config
 from trueloc.models import CommitStats, FileStats, LocalCommitStats, PRStats, StatsAggregator
 from trueloc.utils import CACHE_DIR, get_cache, get_github_token, parse_date
 
@@ -40,6 +40,8 @@ app = typer.Typer(
     help="Count lines of code from GitHub pull requests.",
     context_settings={"help_option_names": ["-h", "--help"]},
     no_args_is_help=True,
+    # Locals in tracebacks would include the GitHub token
+    pretty_exceptions_show_locals=False,
 )
 console = Console()
 
@@ -292,10 +294,10 @@ def count(  # noqa: PLR0913
 
     token = get_github_token()
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-    cache = get_cache(no_cache)
     aggregator = StatsAggregator()
 
     with (
+        get_cache(no_cache) as cache,
         httpx.Client(base_url="https://api.github.com", headers=headers, timeout=30.0) as client,
         Progress(
             SpinnerColumn(),
@@ -307,7 +309,8 @@ def count(  # noqa: PLR0913
             disable=output_json_flag,  # Suppress progress when outputting JSON
         ) as progress,
     ):
-        use_git = local_git and shutil.which("git") is not None
+        # Without a persistent cache, every run would clone again
+        use_git = local_git and not no_cache and git_supports_env_config()
         mirrors = RepoMirrors(Path(cache.directory) / "repos", token) if use_git else None
         gh = GitHubClient(client, cache, mirrors)
 
@@ -325,8 +328,9 @@ def count(  # noqa: PLR0913
         )
 
         if include_direct_commits:
-            # Repos found by search too, e.g. with PRs opened long before `since`
-            repos = sorted(set(repos) | set(prs_by_repo))
+            if repo is None:
+                # Repos found by search too, e.g. with PRs opened long before `since`
+                repos = sorted(set(repos) | set(prs_by_repo))
             commit_task = progress.add_task(
                 "[bold]Direct commits[/bold]", total=len(repos), status=""
             )
