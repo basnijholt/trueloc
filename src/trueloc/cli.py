@@ -98,13 +98,17 @@ def _process_direct_commits(  # noqa: PLR0913
     since: datetime,
     until: datetime,
     aggregator: StatsAggregator,
+    *,
+    is_owned_fork: bool = False,
 ) -> None:
     """Process direct commits for a repo and update aggregator."""
-    default_branch = gh.get_default_branch(repo)
-    if not default_branch:
-        return
-
-    branch_commits = gh.get_branch_commits(repo, default_branch, username, since, until)
+    if is_owned_fork:
+        branch_commits = gh.get_fork_commits(repo, username, since, until)
+    else:
+        default_branch = gh.get_default_branch(repo)
+        if not default_branch:
+            return
+        branch_commits = gh.get_branch_commits(repo, default_branch, username, since, until)
 
     for commit in branch_commits:
         sha = commit["sha"]
@@ -213,6 +217,7 @@ def count(  # noqa: PLR0913, PLR0915
         gh = GitHubClient(client, cache)
 
         # Fetch repos
+        owned_forks: set[str] = set()
         if repo:
             # Single repo mode - construct full name if needed
             if "/" not in repo:
@@ -222,7 +227,8 @@ def count(  # noqa: PLR0913, PLR0915
             fetch_task = progress.add_task("Fetching repositories...", total=None, status="")
             owned = gh.get_user_repos(username)
             contributed = gh.get_contributed_repos(username, since_date, until_date)
-            repos = sorted(set(owned) | set(contributed))
+            owned_forks = set(gh.get_active_owned_forks(username, since_date))
+            repos = sorted(set(owned) | set(contributed) | owned_forks)
             progress.remove_task(fetch_task)
 
         # Main repo progress
@@ -256,7 +262,15 @@ def count(  # noqa: PLR0913, PLR0915
             # Process direct commits
             if include_direct_commits:
                 commit_task = progress.add_task("  Direct commits", total=None, status="")
-                _process_direct_commits(gh, repo, username, since_date, until_date, aggregator)
+                _process_direct_commits(
+                    gh,
+                    repo,
+                    username,
+                    since_date,
+                    until_date,
+                    aggregator,
+                    is_owned_fork=repo in owned_forks,
+                )
                 progress.remove_task(commit_task)
 
             progress.advance(repo_task)

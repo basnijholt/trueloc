@@ -194,6 +194,68 @@ class GitHubClient:
 
         return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
 
+    def get_active_owned_forks(self, username: str, since: datetime) -> list[str]:
+        """Get the user's forks pushed to since `since` (not cached, pushed_at changes)."""
+        try:
+            repos = list(self._paginate(f"/users/{username}/repos", {"type": "owner"}))
+        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+            self._warn_skipped(username, "listing forks", e)
+            return []
+        return [
+            repo["full_name"]
+            for repo in repos
+            if repo["fork"]
+            and repo["pushed_at"]
+            and datetime.fromisoformat(repo["pushed_at"]).replace(tzinfo=None) >= since
+        ]
+
+    def get_fork_commits(
+        self,
+        repo: str,
+        username: str,
+        since: datetime,
+        until: datetime,
+    ) -> list[dict[str, Any]]:
+        """Get commits by the user on a fork's default branch that its parent doesn't have.
+
+        Comparing against the parent excludes upstream commits synced into the fork.
+        """
+
+        def fetch_info() -> dict[str, str]:
+            data = self._request(f"/repos/{repo}").json()
+            return {
+                "branch": data["default_branch"],
+                "parent": data["parent"]["full_name"],
+                "parent_branch": data["parent"]["default_branch"],
+            }
+
+        info = self._cached_fetch(f"fork_info:{repo}", fetch_info, TTL_MUTABLE)
+        if info is None:
+            return []
+        parent_owner = info["parent"].split("/")[0]
+        endpoint = (
+            f"/repos/{repo}/compare/{parent_owner}:{info['parent_branch']}...{info['branch']}"
+        )
+
+        commits: list[dict[str, Any]] = []
+        page = 1
+        try:
+            while True:
+                response = self._request(endpoint, params={"per_page": 100, "page": page})
+                page_commits = response.json()["commits"]
+                commits.extend(page_commits)
+                if len(page_commits) < 100:  # noqa: PLR2004
+                    break
+                page += 1
+        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+            self._warn_skipped(repo, "fork commits", e)
+            return []
+
+        mine = [
+            c for c in commits if c["author"] and c["author"]["login"].lower() == username.lower()
+        ]
+        return self._filter_commits_in_range(mine, since, until)
+
     def _fetch_contributed_repos(self, username: str, since: datetime, until: datetime) -> set[str]:
         """Fetch repos with PR or commit contributions in a range of at most a year."""
         variables = {

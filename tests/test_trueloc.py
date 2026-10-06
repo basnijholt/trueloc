@@ -509,6 +509,117 @@ class TestGitHubClientAPI:
         )
         assert repos == []
 
+    def test_get_active_owned_forks(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """Only owned forks pushed since `since` are candidates."""
+        headers = {"X-RateLimit-Remaining": "5000"}
+        respx_mock.get(
+            "https://api.github.com/users/testuser/repos",
+            params={"type": "owner", "per_page": "100", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "full_name": "testuser/own",
+                        "fork": False,
+                        "pushed_at": "2024-06-10T00:00:00Z",
+                    },
+                    {
+                        "full_name": "testuser/active",
+                        "fork": True,
+                        "pushed_at": "2024-06-10T00:00:00Z",
+                    },
+                    {
+                        "full_name": "testuser/stale",
+                        "fork": True,
+                        "pushed_at": "2023-01-01T00:00:00Z",
+                    },
+                    {"full_name": "testuser/empty", "fork": True, "pushed_at": None},
+                ],
+                headers=headers,
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/users/testuser/repos",
+            params={"type": "owner", "per_page": "100", "page": "2"},
+        ).mock(return_value=httpx.Response(200, json=[], headers=headers))
+
+        assert gh_client.get_active_owned_forks("testuser", datetime(2024, 6, 1)) == [
+            "testuser/active"
+        ]
+
+    def test_get_fork_commits_only_ahead_of_parent(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """Synced upstream commits are excluded: only commits ahead of the parent count."""
+        headers = {"X-RateLimit-Remaining": "5000"}
+        respx_mock.get("https://api.github.com/repos/testuser/fork").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "default_branch": "main",
+                    "parent": {"full_name": "upstream/proj", "default_branch": "master"},
+                },
+                headers=headers,
+            )
+        )
+
+        def commit(sha: str, login: str | None, date: str) -> dict[str, Any]:
+            return {
+                "sha": sha,
+                "author": {"login": login} if login else None,
+                "commit": {"author": {"date": date}, "message": sha},
+            }
+
+        compare = respx_mock.get(
+            "https://api.github.com/repos/testuser/fork/compare/upstream:master...main",
+            params={"per_page": "100", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "commits": [
+                        commit("mine", "TestUser", "2024-06-10T00:00:00Z"),
+                        commit("other", "someone", "2024-06-10T00:00:00Z"),
+                        commit("unlinked", None, "2024-06-10T00:00:00Z"),
+                        commit("old", "testuser", "2023-06-10T00:00:00Z"),
+                    ]
+                },
+                headers=headers,
+            )
+        )
+
+        commits = gh_client.get_fork_commits(
+            "testuser/fork", "testuser", datetime(2024, 6, 1), datetime(2024, 7, 1)
+        )
+
+        assert [c["sha"] for c in commits] == ["mine"]
+        assert compare.call_count == 1
+
+    def test_get_fork_commits_error_returns_empty(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get("https://api.github.com/repos/testuser/fork").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "default_branch": "main",
+                    "parent": {"full_name": "upstream/proj", "default_branch": "main"},
+                },
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/testuser/fork/compare/upstream:main...main"
+        ).mock(return_value=httpx.Response(404, headers={"X-RateLimit-Remaining": "5000"}))
+
+        commits = gh_client.get_fork_commits(
+            "testuser/fork", "testuser", datetime(2024, 6, 1), datetime(2024, 7, 1)
+        )
+        assert commits == []
+
     def test_get_default_branch(
         self, memory_cache: diskcache.Cache, respx_mock: respx.Router
     ) -> None:
@@ -1752,6 +1863,31 @@ class TestCLI:
         result = runner.invoke(app, ["clear-cache"])
         assert result.exit_code == 0
         assert "Cache cleared" in result.stdout
+
+    def test_count_single_repo_json(self, respx_mock: respx.Router) -> None:
+        """`count --repo` runs end to end and prints valid JSON."""
+        from typer.testing import CliRunner
+
+        from trueloc.cli import app
+
+        headers = {"X-RateLimit-Remaining": "5000"}
+        respx_mock.get("https://api.github.com/repos/testuser/repo/pulls").mock(
+            return_value=httpx.Response(200, json=[], headers=headers)
+        )
+        respx_mock.get("https://api.github.com/repos/testuser/repo").mock(
+            return_value=httpx.Response(200, json={"default_branch": "main"}, headers=headers)
+        )
+        respx_mock.get("https://api.github.com/repos/testuser/repo/commits").mock(
+            return_value=httpx.Response(200, json=[], headers=headers)
+        )
+
+        with patch("trueloc.cli.get_github_token", return_value="token"):
+            result = CliRunner().invoke(
+                app, ["count", "testuser", "--since", "1m", "--repo", "repo", "--json"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["summary"]["total_additions"] == 0
 
     def test_cache_isolation_fixture(self) -> None:
         """Verify the global _isolate_cache fixture is working."""
