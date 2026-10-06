@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
@@ -441,11 +441,13 @@ class TestGitHubClientPRCaching:
         since = datetime(2024, 1, 1)
         prs = [{"number": 1, "merged_at": "2024-01-15T10:00:00Z"}]
 
-        gh_client._save_pr_cache(cache_key, since, prs)
+        until = datetime(2024, 2, 1)
+        gh_client._save_pr_cache(cache_key, since, until, prs)
 
         cached = memory_cache.get(cache_key)
         assert cached is not None
         assert cached["cached_since"] == since.isoformat()
+        assert cached["cached_until"] == until.isoformat()
         assert cached["prs"] == prs
 
     def test_get_merged_prs_caches_on_first_call(
@@ -556,6 +558,7 @@ class TestGitHubClientPRCaching:
             cache_key,
             {
                 "cached_since": "2024-01-08T00:00:00",
+                "cached_until": datetime.now(UTC).replace(tzinfo=None).isoformat(),
                 "prs": [
                     {
                         "number": 1,
@@ -678,6 +681,125 @@ class TestGitHubClientPRCaching:
             assert {pr["number"] for pr in prs_5m_4m} == {3, 4}
             # API should NOT have been called again - data comes from cache
             assert route.call_count == 1
+
+    def test_get_merged_prs_refreshes_stale_cache(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """PRs merged after the cache was written must show up on later runs."""
+        cache_key = "merged_prs_v2:user/repo:testuser"
+        cached_until = datetime.now(UTC).replace(tzinfo=None) - timedelta(days=2)
+        old_pr = {"number": 1, "merged_at": "2024-01-10T10:00:00Z", "user": {"login": "testuser"}}
+        memory_cache.set(
+            cache_key,
+            {
+                "cached_since": "2024-01-01T00:00:00",
+                "cached_until": cached_until.isoformat(),
+                "prs": [old_pr],
+            },
+        )
+        merged_at = (cached_until + timedelta(days=1)).isoformat() + "Z"
+        new_pr = {
+            "number": 2,
+            "merged_at": merged_at,
+            "updated_at": merged_at,
+            "user": {"login": "testuser"},
+        }
+        stale = {**old_pr, "updated_at": "2024-01-10T10:00:00Z"}
+        route = respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200, json=[new_pr, stale], headers={"X-RateLimit-Remaining": "5000"}
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+            prs = gh.get_merged_prs("user/repo", "testuser", datetime(2024, 1, 5))
+            assert {pr["number"] for pr in prs} == {1, 2}
+            # Stopped at the first PR updated before the watermark, no page 2 request
+            assert route.call_count == 1
+
+            # Cache is fresh now, so a second call does not hit the API
+            prs = gh.get_merged_prs("user/repo", "testuser", datetime(2024, 1, 5))
+            assert {pr["number"] for pr in prs} == {1, 2}
+            assert route.call_count == 1
+
+    def test_get_merged_prs_refreshes_legacy_cache_and_dedups(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """Entries without cached_until are refreshed from cached_since, deduped by number."""
+        cache_key = "merged_prs_v2:user/repo:testuser"
+        pr1 = {"number": 1, "merged_at": "2024-01-10T10:00:00Z", "user": {"login": "testuser"}}
+        memory_cache.set(cache_key, {"cached_since": "2024-01-08T00:00:00", "prs": [pr1]})
+        refreshed_pr1 = {**pr1, "title": "refreshed", "updated_at": "2024-01-12T10:00:00Z"}
+        pr2 = {
+            "number": 2,
+            "merged_at": "2024-02-01T10:00:00Z",
+            "updated_at": "2024-02-01T10:00:00Z",
+            "user": {"login": "testuser"},
+        }
+        old = {
+            "number": 0,
+            "merged_at": "2024-01-01T10:00:00Z",
+            "updated_at": "2024-01-01T10:00:00Z",
+            "user": {"login": "testuser"},
+        }
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200, json=[pr2, refreshed_pr1, old], headers={"X-RateLimit-Remaining": "5000"}
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+            prs = gh.get_merged_prs("user/repo", "testuser", datetime(2024, 1, 8))
+
+        assert sorted(pr["number"] for pr in prs) == [1, 2]
+        assert next(pr for pr in prs if pr["number"] == 1)["title"] == "refreshed"
+        assert "cached_until" in memory_cache.get(cache_key)
+
+    def test_fetch_prs_stops_at_prs_updated_before_since(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """Pagination stops once PRs were last updated before `since`."""
+        page1 = respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "number": 2,
+                        "merged_at": "2024-01-10T10:00:00Z",
+                        "updated_at": "2024-01-10T10:00:00Z",
+                        "user": {"login": "testuser"},
+                    },
+                    {
+                        "number": 1,
+                        "merged_at": "2023-12-01T10:00:00Z",
+                        "updated_at": "2023-12-01T10:00:00Z",
+                        "user": {"login": "testuser"},
+                    },
+                ],
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+        page2 = respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls",
+            params__contains={"state": "closed", "page": "2"},
+        ).mock(return_value=httpx.Response(200, json=[], headers={"X-RateLimit-Remaining": "5000"}))
+
+        prs = gh_client._fetch_prs_in_range("user/repo", "testuser", datetime(2024, 1, 1))
+
+        assert [pr["number"] for pr in prs] == [2]
+        assert page1.call_count == 1
+        assert page2.call_count == 0
 
 
 class TestGitHubClientRequest:
