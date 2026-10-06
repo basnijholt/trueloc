@@ -2099,8 +2099,12 @@ class TestCLI:
         )
         url = "https://api.github.com/repos/testuser/repo/pulls/1/commits"
         respx_mock.get(url).mock(return_value=ok([]))
-        # Only the name as typed is mocked: scanning both spellings would fail the test
+        # The fork check runs on the name as typed, before search
         respx_mock.get("https://api.github.com/repos/TestUser/Repo").mock(
+            return_value=ok({"default_branch": "main"})
+        )
+        # Direct commits only under GitHub's spelling: scanning both would fail the test
+        respx_mock.get("https://api.github.com/repos/testuser/repo").mock(
             return_value=ok({"default_branch": "main", "size": 10})
         )
         commit = {
@@ -2108,10 +2112,10 @@ class TestCLI:
             "parents": [{"sha": "p"}],
             "commit": {"author": {"date": "2024-06-10T00:00:00Z"}, "message": "Work"},
         }
-        url = "https://api.github.com/repos/TestUser/Repo/commits"
+        url = "https://api.github.com/repos/testuser/repo/commits"
         respx_mock.get(url, params__contains={"page": "1"}).mock(return_value=ok([commit]))
         respx_mock.get(url, params__contains={"page": "2"}).mock(return_value=ok([]))
-        respx_mock.get("https://api.github.com/repos/TestUser/Repo/commits/direct").mock(
+        respx_mock.get("https://api.github.com/repos/testuser/repo/commits/direct").mock(
             return_value=ok({"files": [{"filename": "a.py", "additions": 5, "deletions": 0}]})
         )
 
@@ -2133,7 +2137,10 @@ class TestCLI:
             )
 
         assert result.exit_code == 0, result.output
-        assert json.loads(result.stdout)["summary"]["total_additions"] == 5
+        data = json.loads(result.stdout)
+        assert data["summary"]["total_additions"] == 5
+        # One spelling for both PRs and direct commits, so one row per repo
+        assert {c["repo"] for c in data["direct_commits"]} == {"testuser/repo"}
 
     def test_no_cache_disables_local_git(self, respx_mock: respx.Router) -> None:
         """--no-cache would re-clone every repo on every run."""

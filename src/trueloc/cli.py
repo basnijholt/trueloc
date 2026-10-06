@@ -171,6 +171,14 @@ def _discover_repos(
     return sorted(set(owned) | set(contributed) | owned_forks), owned_forks
 
 
+def _canonical_repo(
+    repo: str, owned_forks: set[str], prs_by_repo: dict[str, list[dict[str, Any]]]
+) -> tuple[list[str], set[str]]:
+    """Replace a repo name as typed with GitHub's spelling, if search found its PRs."""
+    canonical = next((name for name in prs_by_repo if name.lower() == repo.lower()), repo)
+    return [canonical], {canonical} if repo in owned_forks else set()
+
+
 def _merged_prs_by_repo(  # noqa: PLR0913
     gh: GitHubClient,
     username: str,
@@ -319,6 +327,9 @@ def count(  # noqa: PLR0913
         prs_by_repo = _merged_prs_by_repo(
             gh, username, repos, since_date, until_date, single_repo=repo is not None
         )
+        if repo is not None:
+            # Use GitHub's spelling of the name (from search), like for its PRs
+            repos, owned_forks = _canonical_repo(repos[0], owned_forks, prs_by_repo)
         progress.remove_task(fetch_task)
 
         # Process PRs of all repos before direct commits, so PR commits are known when

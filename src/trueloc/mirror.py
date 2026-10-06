@@ -20,7 +20,8 @@ if TYPE_CHECKING:
 console = Console(stderr=True)  # Keep stdout clean for --json
 
 FETCH_CHUNK_SIZE = 500  # PR refs per git fetch, keeping command lines short
-MIN_GIT_VERSION = (2, 31)  # For GIT_CONFIG_COUNT, used to pass the token
+# GIT_CONFIG_COUNT (to pass the token) needs 2.31, GIT_CONFIG_GLOBAL (isolation) 2.32
+MIN_GIT_VERSION = (2, 32)
 
 
 def git_supports_env_config() -> bool:
@@ -61,7 +62,9 @@ class RepoMirrors:
 
     def git_env(self) -> dict[str, str]:
         """Environment for git, passing the token via config (not visible in `ps`)."""
-        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        # Never prompt for credentials: an askpass helper (e.g. a GUI dialog) would hang
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo"}
+        env.pop("SSH_ASKPASS", None)
         if self.token:
             credentials = base64.b64encode(f"x-access-token:{self.token}".encode()).decode()
             env |= {

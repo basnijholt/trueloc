@@ -307,10 +307,10 @@ class TestRepoMirrors:
 
     @pytest.mark.parametrize(
         ("version", "supported"),
-        [("git version 2.30.9", False), ("git version 2.31.0", True), ("git version 2.55.0", True)],
+        [("git version 2.31.9", False), ("git version 2.32.0", True), ("git version 2.55.0", True)],
     )
     def test_git_supports_env_config(self, version: str, supported: bool) -> None:  # noqa: FBT001
-        """GIT_CONFIG_COUNT, used to pass the token, needs git 2.31."""
+        """GIT_CONFIG_COUNT (token) needs git 2.31, GIT_CONFIG_GLOBAL (isolation) 2.32."""
         completed = subprocess.CompletedProcess([], 0, stdout=version)
         with patch("trueloc.mirror.subprocess.run", return_value=completed):
             assert git_supports_env_config() is supported
@@ -323,6 +323,18 @@ class TestRepoMirrors:
         # base64 of "x-access-token:secret"
         assert env["GIT_CONFIG_VALUE_0"] == "Authorization: Basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0"
         assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+    def test_git_never_asks_for_credentials(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An askpass helper (e.g. a GUI dialog) would hang the run on a rejected token."""
+        monkeypatch.setenv("SSH_ASKPASS", "/usr/bin/ssh-askpass")
+        monkeypatch.setenv("GIT_ASKPASS", "/usr/bin/ssh-askpass")
+
+        env = mirrors_for(tmp_path).git_env()
+
+        assert env["GIT_ASKPASS"] == "echo"
+        assert "SSH_ASKPASS" not in env
 
 
 def search_response(
