@@ -42,6 +42,11 @@ app = typer.Typer(
 console = Console()
 
 
+def _commit_fingerprint(commit: dict[str, Any]) -> tuple[str, str]:
+    """Identify a commit by author date and message, which survive a rebase."""
+    return commit["commit"]["author"]["date"], commit["commit"]["message"]
+
+
 def _process_pr(  # noqa: PLR0913
     gh: GitHubClient,
     repo: str,
@@ -63,9 +68,14 @@ def _process_pr(  # noqa: PLR0913
         aggregator.cache_hits += 1
 
     # Always get commit count for stats; also track SHAs for direct commit filtering
-    pr_commits = gh.get_pr_commits(repo, pr["number"])
+    pr_commits = gh.get_pr_commits_raw(repo, pr["number"])
     if include_direct_commits:
-        aggregator.pr_commit_shas.update(pr_commits)
+        aggregator.pr_commit_shas.update(c["sha"] for c in pr_commits)
+        # The squash commit (or last rebased commit) on the default branch
+        if pr.get("merge_commit_sha"):
+            aggregator.pr_commit_shas.add(pr["merge_commit_sha"])
+        # Rebase merges copy every PR commit with a new SHA
+        aggregator.pr_commit_fingerprints.update(_commit_fingerprint(c) for c in pr_commits)
 
     aggregator.add_pr(
         PRStats(
@@ -99,6 +109,11 @@ def _process_direct_commits(  # noqa: PLR0913
     for commit in branch_commits:
         sha = commit["sha"]
         if sha in aggregator.pr_commit_shas:
+            continue
+        # Merge commits duplicate the diff of the merged branch
+        if len(commit.get("parents", [])) > 1:
+            continue
+        if _commit_fingerprint(commit) in aggregator.pr_commit_fingerprints:
             continue
 
         cache_key = f"commit_stats:{repo}:{sha}"

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import diskcache  # type: ignore[import-untyped]
@@ -1303,6 +1303,107 @@ class TestProcessFunctions:
         assert aggregator.total_additions == 50
         assert aggregator.total_deletions == 25
         assert aggregator.prs[0].commit_count == 2
+
+    def _direct_commits_aggregator(
+        self,
+        memory_cache: diskcache.Cache,
+        respx_mock: respx.Router,
+        branch_commits: list[dict[str, Any]],
+    ) -> StatsAggregator:
+        """Run _process_direct_commits after processing one squash-merged PR."""
+        from trueloc.cli import _process_direct_commits, _process_pr
+
+        headers = {"X-RateLimit-Remaining": "5000"}
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/1/commits",
+            params={"per_page": "100", "page": "1"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "sha": "prcommit",
+                        "commit": {
+                            "author": {"date": "2024-01-10T10:00:00Z"},
+                            "message": "Rebased commit\n\nbody",
+                        },
+                    }
+                ],
+                headers=headers,
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/1/commits",
+            params={"per_page": "100", "page": "2"},
+        ).mock(return_value=httpx.Response(200, json=[], headers=headers))
+        respx_mock.get("https://api.github.com/repos/user/repo/commits/prcommit").mock(
+            return_value=httpx.Response(
+                200,
+                json={"files": [{"filename": "a.py", "additions": 10, "deletions": 0}]},
+                headers=headers,
+            )
+        )
+        respx_mock.get("https://api.github.com/repos/user/repo").mock(
+            return_value=httpx.Response(200, json={"default_branch": "main"}, headers=headers)
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/commits",
+            params__contains={"page": "1"},
+        ).mock(return_value=httpx.Response(200, json=branch_commits, headers=headers))
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/commits",
+            params__contains={"page": "2"},
+        ).mock(return_value=httpx.Response(200, json=[], headers=headers))
+        respx_mock.get("https://api.github.com/repos/user/repo/commits/direct").mock(
+            return_value=httpx.Response(
+                200,
+                json={"files": [{"filename": "b.py", "additions": 3, "deletions": 1}]},
+                headers=headers,
+            )
+        )
+
+        with httpx.Client(base_url="https://api.github.com") as client:
+            gh = GitHubClient(client, memory_cache)
+            aggregator = StatsAggregator()
+            pr = {
+                "number": 1,
+                "title": "PR",
+                "merged_at": "2024-01-15T10:00:00Z",
+                "merge_commit_sha": "squash",
+            }
+            _process_pr(gh, "user/repo", pr, True, aggregator, True)
+            _process_direct_commits(
+                gh, "user/repo", "user", datetime(2024, 1, 1), datetime(2024, 2, 1), aggregator
+            )
+        return aggregator
+
+    @staticmethod
+    def _branch_commit(sha: str, date: str, message: str, n_parents: int = 1) -> dict[str, Any]:
+        return {
+            "sha": sha,
+            "parents": [{"sha": f"p{i}"} for i in range(n_parents)],
+            "commit": {"author": {"date": date}, "message": message},
+        }
+
+    def test_direct_commits_skip_pr_merge_commits(
+        self, memory_cache: diskcache.Cache, respx_mock: respx.Router
+    ) -> None:
+        """Squash, rebase, and merge commits of PRs must not be counted again."""
+        branch_commits = [
+            # Squash-merge commit: SHA equals the PR's merge_commit_sha
+            self._branch_commit("squash", "2024-01-15T10:00:00Z", "PR (#1)"),
+            # Rebase-merge copy of a PR commit: new SHA, same author date and message
+            self._branch_commit("rebased", "2024-01-10T10:00:00Z", "Rebased commit\n\nbody"),
+            # Merge commit (e.g. merging someone else's PR): diff duplicates the branch
+            self._branch_commit("merge", "2024-01-16T10:00:00Z", "Merge pull request #2", 2),
+            # Real direct commit
+            self._branch_commit("direct", "2024-01-20T10:00:00Z", "Direct commit"),
+        ]
+        aggregator = self._direct_commits_aggregator(memory_cache, respx_mock, branch_commits)
+
+        assert [c.sha for c in aggregator.direct_commits] == ["direct"]
+        assert aggregator.total_additions == 13
+        assert aggregator.total_deletions == 1
 
 
 class TestHelperFunctions:
