@@ -574,7 +574,7 @@ class TestGitHubClientAPI:
             }
 
         compare = respx_mock.get(
-            "https://api.github.com/repos/testuser/fork/compare/upstream:master...main",
+            "https://api.github.com/repos/testuser/fork/compare/upstream:proj:master...main",
             params={"per_page": "100", "page": "1"},
         ).mock(
             return_value=httpx.Response(
@@ -598,6 +598,61 @@ class TestGitHubClientAPI:
         assert [c["sha"] for c in commits] == ["mine"]
         assert compare.call_count == 1
 
+    def test_get_fork_commits_paginates(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        headers = {"X-RateLimit-Remaining": "5000"}
+        respx_mock.get("https://api.github.com/repos/testuser/fork").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "default_branch": "main",
+                    "parent": {"full_name": "upstream/proj", "default_branch": "main"},
+                },
+                headers=headers,
+            )
+        )
+
+        def page(start: int, n: int) -> list[dict[str, Any]]:
+            return [
+                {
+                    "sha": f"c{i}",
+                    "author": {"login": "testuser"},
+                    "commit": {"author": {"date": "2024-06-10T00:00:00Z"}, "message": "m"},
+                }
+                for i in range(start, start + n)
+            ]
+
+        url = "https://api.github.com/repos/testuser/fork/compare/upstream:proj:main...main"
+        respx_mock.get(url, params={"per_page": "100", "page": "1"}).mock(
+            return_value=httpx.Response(200, json={"commits": page(0, 100)}, headers=headers)
+        )
+        respx_mock.get(url, params={"per_page": "100", "page": "2"}).mock(
+            return_value=httpx.Response(200, json={"commits": page(100, 5)}, headers=headers)
+        )
+
+        commits = gh_client.get_fork_commits(
+            "testuser/fork", "testuser", datetime(2024, 6, 1), datetime(2024, 7, 1)
+        )
+        assert len(commits) == 105
+
+    def test_get_fork_parent_detached_fork(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """A repo without a parent is treated as not a fork instead of crashing."""
+        respx_mock.get("https://api.github.com/repos/testuser/fork").mock(
+            return_value=httpx.Response(
+                200, json={"default_branch": "main"}, headers={"X-RateLimit-Remaining": "5000"}
+            )
+        )
+        assert gh_client.get_fork_parent("testuser/fork") is None
+        assert (
+            gh_client.get_fork_commits(
+                "testuser/fork", "testuser", datetime(2024, 6, 1), datetime(2024, 7, 1)
+            )
+            == []
+        )
+
     def test_get_fork_commits_error_returns_empty(
         self, gh_client: GitHubClient, respx_mock: respx.Router
     ) -> None:
@@ -612,7 +667,7 @@ class TestGitHubClientAPI:
             )
         )
         respx_mock.get(
-            "https://api.github.com/repos/testuser/fork/compare/upstream:main...main"
+            "https://api.github.com/repos/testuser/fork/compare/upstream:proj:main...main"
         ).mock(return_value=httpx.Response(404, headers={"X-RateLimit-Remaining": "5000"}))
 
         commits = gh_client.get_fork_commits(
@@ -1888,6 +1943,91 @@ class TestCLI:
 
         assert result.exit_code == 0, result.output
         assert json.loads(result.stdout)["summary"]["total_additions"] == 0
+
+    def test_count_fork_commit_merged_upstream_counted_once(self, respx_mock: respx.Router) -> None:
+        """A fork commit that reached upstream via a PR is counted once, even though
+        the fork (testuser/proj) sorts before its parent (upstream/proj)."""
+        from typer.testing import CliRunner
+
+        from trueloc.cli import app
+
+        headers = {"X-RateLimit-Remaining": "5000"}
+        recent = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def ok(data: Any) -> httpx.Response:
+            return httpx.Response(200, json=data, headers=headers)
+
+        def paged(url: str, items: list[dict[str, Any]]) -> None:
+            respx_mock.get(url, params__contains={"page": "1"}).mock(return_value=ok(items))
+            respx_mock.get(url, params__contains={"page": "2"}).mock(return_value=ok([]))
+
+        pr_commit = {
+            "sha": "c1",
+            "author": {"login": "testuser"},
+            "parents": [{"sha": "p"}],
+            "commit": {"author": {"date": recent}, "message": "Work"},
+        }
+        paged(
+            "https://api.github.com/users/testuser/repos",
+            [{"full_name": "testuser/proj", "fork": True, "pushed_at": recent}],
+        )
+        respx_mock.post("https://api.github.com/graphql").mock(
+            return_value=ok(
+                {
+                    "data": {
+                        "user": {
+                            "contributionsCollection": {
+                                "pullRequestContributionsByRepository": [
+                                    {"repository": {"nameWithOwner": "upstream/proj"}}
+                                ],
+                                "commitContributionsByRepository": [],
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        paged("https://api.github.com/repos/testuser/proj/pulls", [])
+        paged(
+            "https://api.github.com/repos/upstream/proj/pulls",
+            [
+                {
+                    "number": 1,
+                    "title": "PR",
+                    "merged_at": recent,
+                    "updated_at": recent,
+                    "merge_commit_sha": "squash",
+                    "user": {"login": "testuser"},
+                }
+            ],
+        )
+        paged("https://api.github.com/repos/upstream/proj/pulls/1/commits", [pr_commit])
+        respx_mock.get("https://api.github.com/repos/upstream/proj/commits/c1").mock(
+            return_value=ok({"files": [{"filename": "a.py", "additions": 10, "deletions": 0}]})
+        )
+        respx_mock.get("https://api.github.com/repos/upstream/proj").mock(
+            return_value=ok({"default_branch": "main"})
+        )
+        paged("https://api.github.com/repos/upstream/proj/commits", [])
+        respx_mock.get("https://api.github.com/repos/testuser/proj").mock(
+            return_value=ok(
+                {
+                    "default_branch": "main",
+                    "parent": {"full_name": "upstream/proj", "default_branch": "main"},
+                }
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/testuser/proj/compare/upstream:proj:main...main",
+            params__contains={"page": "1"},
+        ).mock(return_value=ok({"commits": [pr_commit]}))
+
+        with patch("trueloc.cli.get_github_token", return_value="token"):
+            result = CliRunner().invoke(app, ["count", "testuser", "--since", "1m", "--json"])
+
+        assert result.exit_code == 0, result.output
+        summary = json.loads(result.stdout)["summary"]
+        assert summary["total_additions"] == 10
 
     def test_cache_isolation_fixture(self) -> None:
         """Verify the global _isolate_cache fixture is working."""

@@ -209,6 +209,25 @@ class GitHubClient:
             and datetime.fromisoformat(repo["pushed_at"]).replace(tzinfo=None) >= since
         ]
 
+    def get_fork_parent(self, repo: str) -> dict[str, str] | None:
+        """Get a fork's default branch and its parent, or None if it is not a fork.
+
+        Not cached, as a parent can rename its default branch.
+        """
+        try:
+            data = self._request(f"/repos/{repo}").json()
+        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+            self._warn_skipped(repo, "fork details", e)
+            return None
+        parent = data.get("parent")
+        if parent is None:
+            return None
+        return {
+            "branch": data["default_branch"],
+            "parent": parent["full_name"],
+            "parent_branch": parent["default_branch"],
+        }
+
     def get_fork_commits(
         self,
         repo: str,
@@ -221,21 +240,12 @@ class GitHubClient:
         Comparing against the parent excludes upstream commits synced into the fork.
         """
 
-        def fetch_info() -> dict[str, str]:
-            data = self._request(f"/repos/{repo}").json()
-            return {
-                "branch": data["default_branch"],
-                "parent": data["parent"]["full_name"],
-                "parent_branch": data["parent"]["default_branch"],
-            }
-
-        info = self._cached_fetch(f"fork_info:{repo}", fetch_info, TTL_MUTABLE)
+        info = self.get_fork_parent(repo)
         if info is None:
             return []
-        parent_owner = info["parent"].split("/")[0]
-        endpoint = (
-            f"/repos/{repo}/compare/{parent_owner}:{info['parent_branch']}...{info['branch']}"
-        )
+        parent_owner, parent_name = info["parent"].split("/")
+        base = f"{parent_owner}:{parent_name}:{info['parent_branch']}"
+        endpoint = f"/repos/{repo}/compare/{base}...{info['branch']}"
 
         commits: list[dict[str, Any]] = []
         page = 1
