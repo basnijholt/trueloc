@@ -128,7 +128,7 @@ trueloc caches API responses to avoid rate limiting and speed up repeated querie
 
 ### Cache Location
 
-Cache is stored in `~/.cache/trueloc/`.
+Cache is stored in `~/.cache/trueloc/`. Repos with many commits are cloned into `~/.cache/trueloc/repos/` (bare clones, reused and updated on later runs); `trueloc clear-cache` removes them too. Use `--no-local-git` to only use the API.
 
 ### Cache Strategy
 

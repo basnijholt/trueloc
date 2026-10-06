@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import time
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,7 @@ import httpx
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
+from trueloc.local import get_commits_numstat, get_existing_commits, get_pr_commits_local
 from trueloc.models import FileStats
 from trueloc.utils import (
     PR_REFRESH_INTERVAL,
@@ -23,8 +25,11 @@ from trueloc.utils import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from pathlib import Path
 
     import diskcache  # type: ignore[import-untyped]
+
+    from trueloc.mirror import RepoMirrors
 
 console = Console(stderr=True)  # Keep stdout clean for --json
 
@@ -48,6 +53,63 @@ MAX_CONTRIBUTIONS_WINDOW = timedelta(days=365)  # contributionsCollection spans 
 CONTRIBUTIONS_LOOKBACK = timedelta(days=365)
 
 
+SEARCH_PRS_QUERY = """
+query($q: String!, $cursor: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $cursor) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        mergedAt
+        updatedAt
+        author { login }
+        mergeCommit { oid }
+        repository { nameWithOwner diskUsage }
+        commits { totalCount }
+      }
+    }
+  }
+}
+"""
+MAX_SEARCH_RESULTS = 1000  # GitHub search returns at most this many results per query
+# Clone a repo once this many commits need stats; below that, API requests are cheaper
+LOCAL_MIN_COMMITS = 20
+MAX_MIRROR_SIZE_KB = 1_000_000  # Don't clone repos larger than this (GitHub's size in KB)
+
+
+def _pr_key(pr: dict[str, Any]) -> tuple[str | None, int]:
+    """Identify a PR; PRs from search span repos, so include the repo."""
+    return pr.get("repo"), pr["number"]
+
+
+def _dedupe_prs(prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop repeated PRs, keeping the first."""
+    seen = set()
+    result = []
+    for pr in prs:
+        if _pr_key(pr) not in seen:
+            seen.add(_pr_key(pr))
+            result.append(pr)
+    return result
+
+
+def _search_node_to_pr(node: dict[str, Any]) -> dict[str, Any]:
+    """Convert a GraphQL search node to the REST-shaped PR fields used elsewhere."""
+    return {
+        "number": node["number"],
+        "title": node["title"],
+        "merged_at": node["mergedAt"],
+        "updated_at": node["updatedAt"],
+        "merge_commit_sha": (node["mergeCommit"] or {}).get("oid"),
+        "user": {"login": (node["author"] or {}).get("login", "")},
+        "repo": node["repository"]["nameWithOwner"],
+        "commit_count": node["commits"]["totalCount"],
+        "disk_usage": node["repository"]["diskUsage"] or 0,
+    }
+
+
 class GraphQLError(Exception):
     """GraphQL request returned errors (GraphQL reports these with HTTP 200)."""
 
@@ -55,9 +117,16 @@ class GraphQLError(Exception):
 class GitHubClient:
     """GitHub API client with caching and pagination."""
 
-    def __init__(self, client: httpx.Client, cache: diskcache.Cache) -> None:
+    def __init__(
+        self,
+        client: httpx.Client,
+        cache: diskcache.Cache,
+        mirrors: RepoMirrors | None = None,
+    ) -> None:
         self.client = client
         self.cache = cache
+        # Local clones to compute commit stats without API requests (None: API only)
+        self.mirrors = mirrors
 
     def _calc_rate_limit_wait(self, response: httpx.Response) -> int:
         """Calculate seconds to wait for rate limit reset."""
@@ -380,15 +449,35 @@ class GitHubClient:
         - If requesting older data, fetch only the gap and merge
         """
         cache_key = f"merged_prs_v2:{repo}:{username}"
+
+        def fetch(start: datetime, end: datetime | None) -> list[dict[str, Any]]:
+            return self._fetch_prs_in_range(repo, username, start, end)
+
+        prs = self._get_prs_range_cached(cache_key, since, fetch, repo)
+        return [] if prs is None else prs
+
+    def _get_prs_range_cached(
+        self,
+        cache_key: str,
+        since: datetime,
+        fetch: Callable[[datetime, datetime | None], list[dict[str, Any]]],
+        label: str,
+        what: str = "PRs",
+    ) -> list[dict[str, Any]] | None:
+        """Get merged PRs since a date with range-aware caching.
+
+        `fetch(start, end)` fetches PRs merged in [start, end), or since `start` if `end`
+        is None. Returns None if nothing was cached and fetching failed.
+        """
         cached = self.cache.get(cache_key)
         now = datetime.now(UTC).replace(tzinfo=None)
 
         if cached is None:
             try:
-                prs = self._fetch_prs_in_range(repo, username, since)
-            except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
-                self._warn_skipped(repo, "PRs", e)
-                return []
+                prs = fetch(since, None)
+            except (httpx.HTTPStatusError, httpx.TimeoutException, GraphQLError) as e:
+                self._warn_skipped(label, what, e)
+                return None
             self._save_pr_cache(cache_key, since, now, prs)
             return prs
 
@@ -404,35 +493,201 @@ class GitHubClient:
         try:
             # Fetch PRs merged after the cache was written
             if now - cached_until >= PR_REFRESH_INTERVAL:
-                # Overlap the previous fetch to tolerate clock skew; dedup by PR number below
-                newer_prs = self._fetch_prs_in_range(repo, username, cached_until - REFRESH_OVERLAP)
-                newer_numbers = {pr["number"] for pr in newer_prs}
-                prs = newer_prs + [pr for pr in prs if pr["number"] not in newer_numbers]
+                # Overlap the previous fetch to tolerate clock skew; dedup below
+                newer_prs = fetch(cached_until - REFRESH_OVERLAP, None)
+                newer_keys = {_pr_key(pr) for pr in newer_prs}
+                prs = newer_prs + [pr for pr in prs if _pr_key(pr) not in newer_keys]
                 cached_until = now
 
             # Requesting older data - fetch the gap and merge
             if since < cached_since:
-                prs = prs + self._fetch_prs_in_range(repo, username, since, cached_since)
+                # Ranges may share an endpoint, so dedupe
+                prs = _dedupe_prs(prs + fetch(since, cached_since))
                 cached_since = since
-        except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+        except (httpx.HTTPStatusError, httpx.TimeoutException, GraphQLError) as e:
             # Don't save, so the missing range is retried next run
-            self._warn_skipped(repo, "new or older PRs", e)
+            self._warn_skipped(label, "new or older PRs", e)
             return self._filter_prs_since(prs, since)
 
         self._save_pr_cache(cache_key, cached_since, cached_until, prs)
         return self._filter_prs_since(prs, since)
 
+    def search_merged_prs(
+        self,
+        username: str,
+        since: datetime,
+        until: datetime,
+        repo: str | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Get PRs by a user merged in [since, until] across all repos, via GraphQL search.
+
+        A few requests per thousand PRs, instead of listing every repo's PRs. PRs have
+        the REST fields used elsewhere, plus `repo`, `commit_count`, and `disk_usage`
+        (KB). Returns None if the search failed, so callers can fall back to REST.
+        """
+        cache_key = f"merged_prs_search:{username}:{repo or ''}"
+        # Search dates are in UTC, while `since`/`until` are naive local times
+        since_utc = since.astimezone(UTC).replace(tzinfo=None)
+        until_utc = until.astimezone(UTC).replace(tzinfo=None)
+
+        def fetch(start: datetime, end: datetime | None) -> list[dict[str, Any]]:
+            end = end or datetime.now(UTC).replace(tzinfo=None)
+            return self._search_prs_in_window(username, start, end, repo)
+
+        prs = self._get_prs_range_cached(
+            cache_key,
+            since_utc,
+            fetch,
+            username,
+            what="PR search (listing each repo's PRs instead)",
+        )
+        if prs is None:
+            return None
+        return [
+            pr
+            for pr in prs
+            if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) <= until_utc
+        ]
+
+    def _search_prs_in_window(
+        self,
+        username: str,
+        start: datetime,
+        end: datetime,
+        repo: str | None,
+    ) -> list[dict[str, Any]]:
+        """Search PRs merged in [start, end] (naive UTC), splitting busy windows."""
+        query = f"is:pr is:merged author:{username}"
+        if repo:
+            query += f" repo:{repo}"
+        query += f" merged:{start:%Y-%m-%dT%H:%M:%SZ}..{end:%Y-%m-%dT%H:%M:%SZ}"
+        prs: list[dict[str, Any]] = []
+        cursor = None
+        while True:
+            search = self._graphql_search(query, cursor)
+            # Search returns at most 1000 results per query: split the window in half
+            too_many = cursor is None and search["issueCount"] > MAX_SEARCH_RESULTS
+            if too_many and end - start > timedelta(minutes=1):
+                middle = start + (end - start) / 2
+                # `merged:A..B` includes both ends, so a PR at `middle` is in both halves
+                return _dedupe_prs(
+                    self._search_prs_in_window(username, start, middle, repo)
+                    + self._search_prs_in_window(username, middle, end, repo)
+                )
+            prs.extend(_search_node_to_pr(node) for node in search["nodes"] if node)
+            if not search["pageInfo"]["hasNextPage"]:
+                return prs
+            cursor = search["pageInfo"]["endCursor"]
+
+    def _graphql_search(self, query: str, cursor: str | None) -> dict[str, Any]:
+        response = self._request(
+            "/graphql",
+            method="POST",
+            json={"query": SEARCH_PRS_QUERY, "variables": {"q": query, "cursor": cursor}},
+        )
+        payload = response.json()
+        search = (payload.get("data") or {}).get("search")
+        if search is None:
+            errors = payload.get("errors") or []
+            raise GraphQLError("; ".join(error.get("message", "") for error in errors))
+        # Inaccessible PRs (e.g. organizations enforcing SAML) are null nodes with errors
+        skipped = sum(1 for node in search["nodes"] if not node)
+        if skipped:
+            console.print(f"[yellow]Skipping {skipped} PR(s) the token can't access[/yellow]")
+        result: dict[str, Any] = search
+        return result
+
+    def _get_repo_info(self, repo: str) -> dict[str, Any] | None:
+        """Get a repository's default branch and size (KB)."""
+        cache_key = f"repo_info:{repo}"
+
+        def fetch() -> dict[str, Any]:
+            data = self._request(f"/repos/{repo}").json()
+            return {"default_branch": data["default_branch"], "size": data.get("size", 0)}
+
+        result: dict[str, Any] | None = self._cached_fetch(cache_key, fetch, TTL_MUTABLE)
+        return result
+
     def get_default_branch(self, repo: str) -> str | None:
         """Get the default branch for a repository."""
-        cache_key = f"default_branch:{repo}"
+        info = self._get_repo_info(repo)
+        return None if info is None else info["default_branch"]
 
-        def fetch() -> str:
-            response = self._request(f"/repos/{repo}")
-            branch: str = response.json()["default_branch"]
-            return branch
+    def prefetch_pr_commits(self, repo: str, prs: list[dict[str, Any]]) -> None:
+        """Get PR commits and their stats from a local clone, if enough are needed.
 
-        result: str | None = self._cached_fetch(cache_key, fetch, TTL_MUTABLE)
-        return result
+        Fills the same cache entries the API path uses, so later lookups make no requests.
+        PRs need `merge_commit_sha`, `commit_count`, and `disk_usage` (from search).
+        """
+        todo = [
+            pr
+            for pr in prs
+            if pr.get("merge_commit_sha")
+            and not (
+                f"pr_stats_per_commit_v2:{repo}:{pr['number']}" in self.cache
+                and f"pr_commits_raw:{repo}:{pr['number']}" in self.cache
+            )
+        ]
+        n_commits = sum(pr.get("commit_count", 0) for pr in todo)
+        disk_usage = max((pr.get("disk_usage", 0) for pr in todo), default=0)
+        if not self._worth_cloning(repo, n_commits, disk_usage):
+            return
+        path = self.mirrors.sync(repo, [pr["number"] for pr in todo])  # type: ignore[union-attr]
+        if path is None:
+            return
+
+        shas: list[str] = []
+        for pr in todo:
+            cache_key = f"pr_commits_raw:{repo}:{pr['number']}"
+            commits = self.cache.get(cache_key)
+            if commits is None:
+                commits = get_pr_commits_local(path, pr["number"], pr["merge_commit_sha"])
+                # If git disagrees with GitHub (e.g. a commit already in the base branch),
+                # leave the PR to the API
+                if commits is None or len(commits) != pr.get("commit_count"):
+                    continue
+                self.cache.set(cache_key, commits, expire=TTL_IMMUTABLE)
+            shas.extend(c["sha"] for c in commits if len(c.get("parents", [])) <= 1)
+        self._store_local_commit_stats(repo, path, shas)
+
+    def prefetch_commit_stats(self, repo: str, shas: list[str]) -> None:
+        """Compute stats of commits from a local clone, if enough are missing."""
+        missing = [sha for sha in shas if f"commit_stats:{repo}:{sha}" not in self.cache]
+        if not missing or self.mirrors is None:
+            return
+        # Updating an existing clone is cheap, so use it even for a few commits
+        if not self.mirrors.path(repo).exists():
+            info = self._get_repo_info(repo)
+            if info is None or not self._worth_cloning(repo, len(missing), info["size"]):
+                return
+        path = self.mirrors.sync(repo)
+        if path is not None:
+            self._store_local_commit_stats(repo, path, missing)
+
+    def _worth_cloning(self, repo: str, n_commits: int, size_kb: int) -> bool:
+        if self.mirrors is None or n_commits == 0:
+            return False
+        if self.mirrors.path(repo).exists():
+            return True
+        return n_commits >= LOCAL_MIN_COMMITS and size_kb <= MAX_MIRROR_SIZE_KB
+
+    def _store_local_commit_stats(self, repo: str, path: Path, shas: list[str]) -> None:
+        """Cache stats computed with `git log --numstat` for the commits found locally."""
+        try:
+            existing = get_existing_commits(path, shas)
+            stats = get_commits_numstat(path, sorted(existing))
+        except subprocess.CalledProcessError as e:
+            console.print(
+                f"[yellow]git failed for {repo}, using the API instead: {e.stderr}[/yellow]"
+            )
+            return
+        for sha, (additions, deletions, by_ext) in stats.items():
+            ext_data = {ext: ext_stats.to_tuple() for ext, ext_stats in by_ext.items()}
+            self.cache.set(
+                f"commit_stats:{repo}:{sha}",
+                (additions, deletions, ext_data),
+                expire=TTL_IMMUTABLE,
+            )
 
     def _fetch_commits_in_range(
         self,

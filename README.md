@@ -336,6 +336,7 @@ Congratulations! You've written over a million lines of code since 1y!
 - **File extension breakdown**: Shows which languages you've worked with
 - **JSON output**: Machine-readable output for scripting (`--json`)
 - **Disk caching**: Uses diskcache to avoid hammering the GitHub API
+- **Local git stats**: Repos with many commits are cloned once and stats come from `git log --numstat`, using far fewer API requests (`--no-local-git` to disable)
 - **Rate limit handling**: Automatically waits when rate limited with progress bar
 - **Flexible dates**: Supports relative (`5d`, `2w`, `3m`, `1y`) and natural language (`last month`)
 <!-- SECTION:features:END -->
