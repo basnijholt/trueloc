@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import time
 from collections import defaultdict
@@ -49,7 +50,6 @@ query($login: String!, $from: DateTime!, $to: DateTime!) {
 }
 """
 MAX_CONTRIBUTED_REPOS = 100  # maxRepositories limit of contributionsCollection
-MAX_CONTRIBUTIONS_WINDOW = timedelta(days=365)  # contributionsCollection spans at most a year
 # PR contributions count when a PR is opened, so look back to catch PRs merged later
 CONTRIBUTIONS_LOOKBACK = timedelta(days=365)
 
@@ -74,10 +74,16 @@ query($q: String!, $cursor: String) {
   }
 }
 """
+PER_PAGE = 100  # Items per page for paginated REST endpoints
 MAX_SEARCH_RESULTS = 1000  # GitHub search returns at most this many results per query
 # Clone a repo once this many commits need stats; below that, API requests are cheaper
 LOCAL_MIN_COMMITS = 20
 MAX_MIRROR_SIZE_KB = 1_000_000  # Don't clone repos larger than this (GitHub's size in KB)
+
+
+def _year_start(year: int) -> datetime:
+    """January 1st of a year, in naive UTC."""
+    return datetime(year, 1, 1, tzinfo=UTC).replace(tzinfo=None)
 
 
 def _pr_key(pr: dict[str, Any]) -> tuple[str | None, int]:
@@ -214,11 +220,14 @@ class GitHubClient:
         params = params or {}
         page = 1
         while True:
-            response = self._request(endpoint, params={**params, "per_page": 100, "page": page})
+            response = self._request(
+                endpoint, params={**params, "per_page": PER_PAGE, "page": page}
+            )
             items = response.json()
-            if not items:
-                break
             yield from items
+            # A short page is the last one; no need to request an empty page
+            if len(items) < PER_PAGE:
+                break
             page += 1
 
     def _cached_fetch(
@@ -264,20 +273,20 @@ class GitHubClient:
 
         return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
 
-    def get_active_owned_forks(self, username: str, since: datetime) -> list[str]:
-        """Get the user's forks pushed to since `since` (not cached, pushed_at changes)."""
+    def get_active_owned_forks(self, username: str, since: datetime) -> dict[str, datetime]:
+        """Get the user's forks pushed to since `since`, with when (not cached)."""
         try:
             repos = list(self._paginate(f"/users/{username}/repos", {"type": "owner"}))
         except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
             self._warn_skipped(username, "listing forks", e)
-            return []
-        return [
-            repo["full_name"]
-            for repo in repos
-            if repo["fork"]
-            and repo["pushed_at"]
-            and datetime.fromisoformat(repo["pushed_at"]).replace(tzinfo=None) >= since
-        ]
+            return {}
+        forks = {}
+        for repo in repos:
+            if repo["fork"] and repo["pushed_at"]:
+                pushed_at = datetime.fromisoformat(repo["pushed_at"]).replace(tzinfo=None)
+                if pushed_at >= since:
+                    forks[repo["full_name"]] = pushed_at
+        return forks
 
     def get_fork_parent(self, repo: str) -> dict[str, str] | None:
         """Get a fork's default branch and its parent, or None if it is not a fork.
@@ -304,15 +313,32 @@ class GitHubClient:
         username: str,
         since: datetime,
         until: datetime,
+        pushed_at: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Get commits by the user on a fork's default branch that its parent doesn't have.
 
-        Comparing against the parent excludes upstream commits synced into the fork.
+        Comparing against the parent excludes upstream commits synced into the fork. The
+        comparison is cached until the fork is pushed to again (`pushed_at`).
         """
+        cache_key = f"fork_commits:{repo}:{pushed_at.isoformat()}" if pushed_at else None
+        commits = self.cache.get(cache_key) if cache_key else None
+        if commits is None:
+            commits = self._fetch_fork_commits(repo)
+            if commits is None:
+                return []
+            if cache_key:
+                self.cache.set(cache_key, commits, expire=TTL_MUTABLE)
 
+        mine = [
+            c for c in commits if c["author"] and c["author"]["login"].lower() == username.lower()
+        ]
+        return self._filter_commits_in_range(mine, since, until)
+
+    def _fetch_fork_commits(self, repo: str) -> list[dict[str, Any]] | None:
+        """Fetch the commits on a fork's default branch that its parent doesn't have."""
         info = self.get_fork_parent(repo)
         if info is None:
-            return []
+            return None
         parent_owner, parent_name = info["parent"].split("/")
         base = f"{parent_owner}:{parent_name}:{info['parent_branch']}"
         endpoint = f"/repos/{repo}/compare/{base}...{info['branch']}"
@@ -329,12 +355,8 @@ class GitHubClient:
                 page += 1
         except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
             self._warn_skipped(repo, "fork commits", e)
-            return []
-
-        mine = [
-            c for c in commits if c["author"] and c["author"]["login"].lower() == username.lower()
-        ]
-        return self._filter_commits_in_range(mine, since, until)
+            return None
+        return commits
 
     def _fetch_contributed_repos(self, username: str, since: datetime, until: datetime) -> set[str]:
         """Fetch repos with PR or commit contributions in a range of at most a year."""
@@ -376,15 +398,30 @@ class GitHubClient:
         `since` and `until` are naive UTC, like all dates in GitHubClient.
         """
         repos: set[str] = set()
+        now = datetime.now(UTC).replace(tzinfo=None)
         start = since - CONTRIBUTIONS_LOOKBACK
         try:
-            while start < until:
-                end = min(start + MAX_CONTRIBUTIONS_WINDOW, until)
-                repos |= self._fetch_contributed_repos(username, start, end)
-                start = end
+            # Calendar years (contributionsCollection spans at most a year), so windows are
+            # the same on every run and completed years can be cached
+            for year in range(start.year, until.year + 1):
+                year_start, year_end = _year_start(year), _year_start(year + 1)
+                if year_end <= now - timedelta(days=1):
+                    repos |= self._get_contributed_repos_in_year(username, year)
+                else:
+                    repos |= self._fetch_contributed_repos(username, year_start, min(year_end, now))
         except (httpx.HTTPStatusError, httpx.TimeoutException, GraphQLError) as e:
             self._warn_skipped(username, "discovering contributed repos", e)
         return sorted(repos)
+
+    def _get_contributed_repos_in_year(self, username: str, year: int) -> set[str]:
+        """Repos with contributions in a completed year, which no longer change."""
+        cache_key = f"contributed_repos:{username}:{year}"
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return set(cached)
+        repos = self._fetch_contributed_repos(username, _year_start(year), _year_start(year + 1))
+        self.cache.set(cache_key, sorted(repos), expire=TTL_IMMUTABLE)
+        return repos
 
     def _fetch_prs_in_range(
         self,
@@ -743,28 +780,60 @@ class GitHubClient:
             expire=TTL_IMMUTABLE,
         )
 
-    def get_branch_commits(
+    def get_branch_commits(  # noqa: PLR0913
         self,
         repo: str,
         branch: str,
         username: str,
         since: datetime,
         until: datetime,
+        pushed_at: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Get commits on a branch by a user within a date range.
 
         Uses smart range-aware caching:
         - If cached range covers requested range, filter locally (instant)
+        - If the repo was not pushed to since the last fetch (`pushed_at`), extend the
+          cached range without a request
         - If requesting older/newer data, fetch only the gap and merge
         """
         cache_key = f"branch_commits_v3:{repo}:{branch}:{username}"
         try:
-            return self._get_branch_commits(cache_key, repo, branch, username, since, until)
+            return self._get_branch_commits(
+                cache_key, repo, branch, username, since, until, pushed_at
+            )
         except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
             # E.g. 409 for an empty repository; skip the repo instead of aborting the run
             self._warn_skipped(repo, "direct commits", e)
             cached = self.cache.get(cache_key)
             return self._filter_commits_in_range(cached["commits"], since, until) if cached else []
+
+    def get_pushed_at(self, repos: list[str]) -> dict[str, datetime]:
+        """Get when each repo was last pushed to (naive UTC), 100 repos per GraphQL request.
+
+        Repos that can't be accessed are left out.
+        """
+        pushed: dict[str, datetime] = {}
+        for i in range(0, len(repos), PER_PAGE):
+            chunk = repos[i : i + PER_PAGE]
+            fields = " ".join(
+                f"r{j}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)})"
+                " { pushedAt }"
+                for j, (owner, name) in enumerate(repo.split("/", 1) for repo in chunk)
+            )
+            try:
+                response = self._request(
+                    "/graphql", method="POST", json={"query": f"query {{ {fields} }}"}
+                )
+            except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
+                self._warn_skipped("repos", "checking for new pushes", e)
+                continue
+            data = response.json().get("data") or {}
+            for j, repo in enumerate(chunk):
+                node = data.get(f"r{j}")
+                if node and node.get("pushedAt"):
+                    pushed[repo] = datetime.fromisoformat(node["pushedAt"]).replace(tzinfo=None)
+        return pushed
 
     def _get_branch_commits(  # noqa: PLR0913
         self,
@@ -774,6 +843,7 @@ class GitHubClient:
         username: str,
         since: datetime,
         until: datetime,
+        pushed_at: datetime | None,
     ) -> list[dict[str, Any]]:
         cached = self.cache.get(cache_key)
 
@@ -789,6 +859,11 @@ class GitHubClient:
 
         # Requested range is within cached range - filter locally!
         if since >= cached_since and until <= cached_until:
+            return self._filter_commits_in_range(commits, since, until)
+
+        # No push since the last fetch (with a margin for clock skew): no new commits
+        if since >= cached_since and pushed_at and pushed_at <= cached_until - REFRESH_OVERLAP:
+            self._save_commits_cache(cache_key, cached_since, until, commits)
             return self._filter_commits_in_range(commits, since, until)
 
         # Need to expand the cached range

@@ -244,4 +244,4 @@ class TestGraphQLRanges:
         gh_client.get_contributed_repos("u", datetime(2024, 6, 1), datetime(2024, 7, 1))
 
         variables = json.loads(route.calls[-1].request.content)["variables"]
-        assert variables["to"] == "2024-07-01T00:00:00Z"
+        assert variables["to"] == "2025-01-01T00:00:00Z"  # Year boundary in UTC, not local

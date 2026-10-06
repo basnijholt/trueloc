@@ -75,6 +75,8 @@ class StatsAggregator:
     pr_commit_shas: set[str] = field(default_factory=set)
     # (author date, message) of PR commits, to detect rebase-merged copies with new SHAs
     pr_commit_fingerprints: set[tuple[str, str]] = field(default_factory=set)
+    # Direct commits counted so far; repos copied or forked from another share commits
+    direct_commit_shas: set[str] = field(default_factory=set)
 
     def add_extension_stats(self, by_ext: dict[str, FileStats]) -> None:
         """Merge extension stats into totals."""
@@ -92,6 +94,7 @@ class StatsAggregator:
     def add_commit(self, commit: CommitStats) -> None:
         """Add a direct commit and update totals."""
         self.direct_commits.append(commit)
+        self.direct_commit_shas.add(commit.sha)
         self.total_additions += commit.additions
         self.total_deletions += commit.deletions
         self.add_extension_stats(commit.by_extension)
