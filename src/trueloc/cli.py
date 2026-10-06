@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ from trueloc.display import (
 )
 from trueloc.github import GitHubClient
 from trueloc.local import get_commit_numstat, get_local_commits
+from trueloc.mirror import RepoMirrors
 from trueloc.models import CommitStats, FileStats, LocalCommitStats, PRStats, StatsAggregator
 from trueloc.utils import CACHE_DIR, get_cache, get_github_token, parse_date
 
@@ -110,16 +112,18 @@ def _process_direct_commits(  # noqa: PLR0913
             return
         branch_commits = gh.get_branch_commits(repo, default_branch, username, since, until)
 
-    for commit in branch_commits:
-        sha = commit["sha"]
-        if sha in aggregator.pr_commit_shas:
-            continue
+    candidates = [
+        commit
+        for commit in branch_commits
+        if commit["sha"] not in aggregator.pr_commit_shas
         # Merge commits duplicate the diff of the merged branch
-        if len(commit.get("parents", [])) > 1:
-            continue
-        if _commit_fingerprint(commit) in aggregator.pr_commit_fingerprints:
-            continue
+        and len(commit.get("parents", [])) <= 1
+        and _commit_fingerprint(commit) not in aggregator.pr_commit_fingerprints
+    ]
+    gh.prefetch_commit_stats(repo, [commit["sha"] for commit in candidates])
 
+    for commit in candidates:
+        sha = commit["sha"]
         cache_key = f"commit_stats:{repo}:{sha}"
         was_cached = cache_key in gh.cache
 
@@ -165,6 +169,69 @@ def _discover_repos(
     return sorted(set(owned) | set(contributed) | owned_forks), owned_forks
 
 
+def _merged_prs_by_repo(  # noqa: PLR0913
+    gh: GitHubClient,
+    username: str,
+    repos: list[str],
+    since: datetime,
+    until: datetime,
+    *,
+    single_repo: bool,
+) -> dict[str, list[dict[str, Any]]]:
+    """Get the user's PRs merged in [since, until], grouped by repo."""
+    prs = gh.search_merged_prs(username, since, until, repo=repos[0] if single_repo else None)
+    if prs is not None:
+        by_repo: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for pr in prs:
+            by_repo[pr["repo"]].append(pr)
+        return dict(by_repo)
+
+    # Search failed: list the PRs of each repo instead
+    by_repo = {}
+    for repo in repos:
+        repo_prs = [
+            pr
+            for pr in gh.get_merged_prs(repo, username, since)
+            if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) <= until
+        ]
+        if repo_prs:
+            by_repo[repo] = repo_prs
+    return by_repo
+
+
+def _process_prs_by_repo(  # noqa: PLR0913
+    gh: GitHubClient,
+    prs_by_repo: dict[str, list[dict[str, Any]]],
+    progress: Progress,
+    aggregator: StatsAggregator,
+    per_commit: bool,  # noqa: FBT001
+    include_direct_commits: bool,  # noqa: FBT001
+) -> None:
+    """Process the PRs of every repo, showing progress."""
+    pr_repos = sorted(prs_by_repo)
+    repo_task = progress.add_task(
+        f"[bold]Repos[/bold] (0/{len(pr_repos)})", total=len(pr_repos), status=""
+    )
+    for repo_idx, repo_name in enumerate(pr_repos, 1):
+        progress.update(
+            repo_task,
+            description=f"[bold]Repos[/bold] ({repo_idx}/{len(pr_repos)})",
+            status=repo_name.split("/")[-1][:20],
+        )
+        prs = prs_by_repo[repo_name]
+        if per_commit:
+            gh.prefetch_pr_commits(repo_name, prs)
+
+        pr_task = progress.add_task("  PRs", total=len(prs), status=f"0/{len(prs)}")
+        for pr in prs:
+            progress.update(pr_task, status=f"#{pr['number']}")
+            _process_pr(gh, repo_name, pr, per_commit, aggregator, include_direct_commits)
+            progress.advance(pr_task)
+        progress.remove_task(pr_task)
+        progress.advance(repo_task)
+    progress.remove_task(repo_task)
+
+
 @app.command()
 def count(  # noqa: PLR0913
     username: str = typer.Argument(..., help="GitHub username"),
@@ -195,6 +262,11 @@ def count(  # noqa: PLR0913
         False,  # noqa: FBT003
         "--json",
         help="Output results as JSON for scripting",
+    ),
+    local_git: bool = typer.Option(
+        True,  # noqa: FBT003
+        "--local-git/--no-local-git",
+        help="Clone repos with many commits and compute stats with git (far fewer API requests)",
     ),
     repo: str | None = typer.Option(
         None,
@@ -235,45 +307,26 @@ def count(  # noqa: PLR0913
             disable=output_json_flag,  # Suppress progress when outputting JSON
         ) as progress,
     ):
-        gh = GitHubClient(client, cache)
+        use_git = local_git and shutil.which("git") is not None
+        mirrors = RepoMirrors(Path(cache.directory) / "repos", token) if use_git else None
+        gh = GitHubClient(client, cache, mirrors)
 
         fetch_task = progress.add_task("Fetching repositories...", total=None, status="")
         repos, owned_forks = _discover_repos(gh, username, repo, since_date, until_date)
+        prs_by_repo = _merged_prs_by_repo(
+            gh, username, repos, since_date, until_date, single_repo=repo is not None
+        )
         progress.remove_task(fetch_task)
 
         # Process PRs of all repos before direct commits, so PR commits are known when
         # filtering direct commits in other repos (e.g. a fork whose PR merged upstream)
-        repo_task = progress.add_task(
-            f"[bold]Repos[/bold] (0/{len(repos)})", total=len(repos), status=""
+        _process_prs_by_repo(
+            gh, prs_by_repo, progress, aggregator, per_commit, include_direct_commits
         )
 
-        for repo_idx, repo_name in enumerate(repos, 1):
-            short_repo = repo_name.split("/")[-1][:20]
-            progress.update(
-                repo_task,
-                description=f"[bold]Repos[/bold] ({repo_idx}/{len(repos)})",
-                status=short_repo,
-            )
-
-            # Fetch PRs for this repo
-            prs = [
-                pr
-                for pr in gh.get_merged_prs(repo_name, username, since_date)
-                if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) <= until_date
-            ]
-
-            if prs:
-                pr_task = progress.add_task("  PRs", total=len(prs), status=f"0/{len(prs)}")
-                for pr in prs:
-                    progress.update(pr_task, status=f"#{pr['number']}")
-                    _process_pr(gh, repo_name, pr, per_commit, aggregator, include_direct_commits)
-                    progress.advance(pr_task)
-                progress.remove_task(pr_task)
-
-            progress.advance(repo_task)
-        progress.remove_task(repo_task)
-
         if include_direct_commits:
+            # Repos found by search too, e.g. with PRs opened long before `since`
+            repos = sorted(set(repos) | set(prs_by_repo))
             commit_task = progress.add_task(
                 "[bold]Direct commits[/bold]", total=len(repos), status=""
             )
@@ -323,6 +376,7 @@ def clear_cache() -> None:
     """Clear the disk cache."""
     cache = diskcache.Cache(str(CACHE_DIR))
     cache.clear()
+    shutil.rmtree(CACHE_DIR / "repos", ignore_errors=True)
     console.print("[green]Cache cleared![/green]")
 
 

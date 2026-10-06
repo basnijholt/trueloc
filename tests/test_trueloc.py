@@ -1955,12 +1955,20 @@ class TestCLI:
         assert "Cache cleared" in result.stdout
 
     def test_count_single_repo_json(self, respx_mock: respx.Router) -> None:
-        """`count --repo` runs end to end and prints valid JSON."""
+        """`count --repo` runs end to end and prints valid JSON, listing PRs via REST
+        when search fails."""
         from typer.testing import CliRunner
 
         from trueloc.cli import app
 
         headers = {"X-RateLimit-Remaining": "5000"}
+        respx_mock.post("https://api.github.com/graphql").mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": {"search": None}, "errors": [{"type": "TIMEOUT", "message": "x"}]},
+                headers=headers,
+            )
+        )
         respx_mock.get("https://api.github.com/repos/testuser/repo/pulls").mock(
             return_value=httpx.Response(200, json=[], headers=headers)
         )

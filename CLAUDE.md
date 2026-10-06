@@ -9,7 +9,8 @@ src/trueloc/
 ├── cli.py       # Typer commands (count, count-local, clear-cache)
 ├── display.py   # Rich table formatting and JSON output
 ├── github.py    # GitHubClient - API calls with caching
-├── local.py     # Local git repo analysis (git log/show)
+├── local.py     # Local git repo analysis (git log/show, numstat parsing)
+├── mirror.py    # RepoMirrors - bare clones of GitHub repos for local stats
 ├── models.py    # Pydantic-style dataclasses for stats
 └── utils.py     # Shared utilities (cache, token, date parsing)
 ```
@@ -26,6 +27,8 @@ Cache lives at `~/.cache/trueloc/` using diskcache with SQLite backend.
 - `commit_stats:{repo}:{sha}` - Individual commit stats (immutable)
 - `user_repos_v2:{user}` - Owned non-fork repos (7 days)
 - `merged_prs_v2:{repo}:{author}` - Merged PRs with `cached_since`/`cached_until` watermarks
+- `merged_prs_search:{author}:{repo}` - Merged PRs from GraphQL search (same watermarks, UTC)
+- `repo_info:{repo}` - Default branch and size (7 days)
 - `branch_commits_v2:{repo}:{branch}:{author}` - Branch commits with range-aware caching
 
 The `v2` keys use range-aware caching: they store `cached_since`/`cached_until` timestamps and only fetch the missing ranges on subsequent calls. Merged PRs are re-checked for newly merged ones once `cached_until` is older than `PR_REFRESH_INTERVAL` (1 hour).
@@ -34,9 +37,13 @@ The `v2` keys use range-aware caching: they store `cached_since`/`cached_until` 
 
 1. `get_user_repos()` → user's own non-fork repos, plus `get_contributed_repos()` → repos with PR/commit contributions (GraphQL `contributionsCollection`, includes other owners' and private repos)
    - Owned forks pushed since `--since` (`get_active_owned_forks()`): direct commits come from `get_fork_commits()`, i.e. commits ahead of the parent, so synced upstream commits are skipped
-2. For each repo: `get_merged_prs()` → PRs merged by user since date
+2. `search_merged_prs()` → all PRs merged by user in the range via GraphQL search (falls back to `get_merged_prs()` per repo)
 3. For each PR: `get_pr_stats_per_commit()` or `get_pr_stats_net()`
 4. For direct commits: `get_branch_commits()` → `get_commit_stats()` for each
+
+### Local git stats
+
+Before steps 3 and 4, `prefetch_pr_commits()` / `prefetch_commit_stats()` fill the `pr_commits_raw` and `commit_stats` cache entries from a bare clone (`RepoMirrors` in `mirror.py`, under `~/.cache/trueloc/repos/`) when a repo needs at least `LOCAL_MIN_COMMITS` commits and is at most `MAX_MIRROR_SIZE_KB`. PR commits are `refs/pull/N/head --not <merge commit>^1`; stats come from one `git log --numstat` call (`local.py`). Everything else falls back to the API.
 
 ### Testing
 
