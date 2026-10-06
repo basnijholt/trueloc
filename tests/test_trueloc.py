@@ -489,15 +489,16 @@ class TestGitHubClientAPI:
                     },
                     headers={"X-RateLimit-Remaining": "5000"},
                 ),
+                self._contributions(["org/c"], []),
             ]
         )
         repos = gh_client.get_contributed_repos(
             "testuser", datetime(2023, 6, 1), datetime(2024, 7, 1)
         )
-        # Repos found before the error are kept, and the failure is reported
-        assert repos == ["org/a"]
+        # Years 2022 to 2024: other years still count, and the failure is reported
+        assert repos == ["org/a", "org/c"]
         err = capsys.readouterr().err
-        assert "Skipping discovering contributed repos for testuser (GraphQL: x)" in err
+        assert "Skipping discovering contributed repos in 2023 for testuser (GraphQL: x)" in err
 
     def test_get_contributed_repos_http_error_warns(
         self, gh_client: GitHubClient, respx_mock: respx.Router

@@ -316,7 +316,13 @@ def count(  # noqa: PLR0913
 
     with (
         get_cache(no_cache) as cache,
-        httpx.Client(base_url="https://api.github.com", headers=headers, timeout=30.0) as client,
+        httpx.Client(
+            base_url="https://api.github.com",
+            headers=headers,
+            timeout=30.0,
+            # Renamed or transferred repos redirect to their new name
+            follow_redirects=True,
+        ) as client,
         Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),

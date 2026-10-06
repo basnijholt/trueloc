@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 import diskcache  # type: ignore[import-untyped]
 import httpx
@@ -82,6 +83,9 @@ class TestContributedRepos:
 
         assert first == second == ["org/a"]
         assert route.call_count == 2
+        # Not forever: repos get renamed or transferred, and access changes
+        _value, expire_time = gh_client.cache.get("contributed_repos:u:2023", expire_time=True)
+        assert expire_time is not None
 
     def test_current_year_is_refetched(
         self, gh_client: GitHubClient, respx_mock: respx.Router
@@ -95,9 +99,10 @@ class TestContributedRepos:
         calls = route.call_count
         gh_client.get_contributed_repos("u", now - timedelta(days=1), now)
 
-        this_year = f"{now.year}-01-01T00:00:00Z"
-        assert windows(route)[-1][0] == this_year
-        assert route.call_count == calls + 1  # Only the current year again
+        # Only years that may still change are queried again (on Jan 1 also the last one)
+        again = windows(route)[calls:]
+        assert again
+        assert all(int(start[:4]) >= (now - timedelta(days=1)).year for start, _end in again)
 
 
 def commit(sha: str, date: str) -> dict[str, Any]:
@@ -180,6 +185,61 @@ class TestSkipUnchangedRepos:
         assert route.call_count == 1
         assert [c["sha"] for c in commits] == ["new"]
 
+    def test_push_just_before_watermark_is_fetched(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """Within the clock-skew margin of the watermark, fetch to be safe."""
+        cache_branch_commits(gh_client, [])
+        route = respx_mock.get("https://api.github.com/repos/u/r/commits").mock(
+            return_value=httpx.Response(200, json=[], headers=HEADERS)
+        )
+
+        gh_client.get_branch_commits(
+            "u/r",
+            "main",
+            "u",
+            datetime(2024, 6, 1),
+            datetime(2024, 7, 1),
+            pushed_at=datetime(2024, 6, 14, 23, 55),
+        )
+
+        assert route.call_count == 1
+
+    def test_future_until_is_not_cached_as_fetched(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """The cached range must end when it was fetched, not at a future --until."""
+        respx_mock.get("https://api.github.com/repos/u/r/commits").mock(
+            return_value=httpx.Response(200, json=[], headers=HEADERS)
+        )
+        now = datetime.now(UTC).replace(tzinfo=None)
+
+        gh_client.get_branch_commits(
+            "u/r", "main", "u", now - timedelta(days=30), now + timedelta(days=30)
+        )
+
+        cached_until = datetime.fromisoformat(
+            gh_client.cache.get("branch_commits_v3:u/r:main:u")["cached_until"]
+        )
+        assert cached_until <= datetime.now(UTC).replace(tzinfo=None)
+
+    def test_get_pushed_at_warns_on_failure(
+        self,
+        gh_client: GitHubClient,
+        respx_mock: respx.Router,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        respx_mock.post("https://api.github.com/graphql").mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": None, "errors": [{"type": "RATE_LIMITED", "message": "slow down"}]},
+                headers=HEADERS,
+            )
+        )
+
+        assert gh_client.get_pushed_at(["org/a"]) == {}
+        assert "slow down" in capsys.readouterr().err
+
 
 class TestForkCommitsCache:
     def mock_fork(self, respx_mock: respx.Router) -> tuple[respx.Route, respx.Route]:
@@ -257,3 +317,63 @@ def test_direct_commit_in_two_repos_counted_once(
 
     assert [c.repo for c in aggregator.direct_commits] == ["a/proj"]
     assert aggregator.total_additions == 5
+
+
+def test_count_passes_pushed_at_to_direct_commits() -> None:
+    """Forks use their listing's pushed_at; other repos one batched lookup."""
+    from typer.testing import CliRunner
+
+    from trueloc.cli import app
+
+    fork_pushed, repo_pushed = datetime(2024, 6, 10), datetime(2024, 6, 11)
+    lookups = []
+    calls = {}
+
+    def get_pushed_at(_self: GitHubClient, repos: list[str]) -> dict[str, datetime]:
+        lookups.append(repos)
+        return {"u/repo": repo_pushed}
+
+    def process(*args: Any, **kwargs: Any) -> None:
+        calls[args[1]] = kwargs
+
+    with (
+        patch("trueloc.cli.get_github_token", return_value="token"),
+        patch(
+            "trueloc.cli._discover_repos",
+            return_value=(["u/fork", "u/repo"], {"u/fork": fork_pushed}),
+        ),
+        patch("trueloc.cli._merged_prs_by_repo", return_value={}),
+        patch.object(GitHubClient, "get_pushed_at", get_pushed_at),
+        patch("trueloc.cli._process_direct_commits", process),
+    ):
+        result = CliRunner().invoke(app, ["count", "u", "--since", "1m", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert lookups == [["u/repo"]]  # Forks are not looked up again
+    assert calls["u/fork"] == {"is_owned_fork": True, "pushed_at": fork_pushed}
+    assert calls["u/repo"] == {"is_owned_fork": False, "pushed_at": repo_pushed}
+
+
+def test_api_client_follows_redirects() -> None:
+    """Renamed or transferred repos answer with a redirect to their new name."""
+    from typer.testing import CliRunner
+
+    from trueloc.cli import app
+
+    clients = []
+    real_client = httpx.Client
+
+    def capture(*args: Any, **kwargs: Any) -> httpx.Client:
+        clients.append(kwargs)
+        return real_client(*args, **kwargs)
+
+    with (
+        patch("trueloc.cli.get_github_token", return_value="token"),
+        patch("trueloc.cli.httpx.Client", capture),
+        patch("trueloc.cli._discover_repos", return_value=([], {})),
+        patch("trueloc.cli._merged_prs_by_repo", return_value={}),
+    ):
+        result = CliRunner().invoke(app, ["count", "u", "--since", "1m", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert clients[0]["follow_redirects"] is True

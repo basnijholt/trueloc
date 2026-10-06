@@ -29,7 +29,7 @@ Cache lives at `~/.cache/trueloc/` using diskcache with SQLite backend.
 - `merged_prs_v3:{repo}:{author}` - Merged PRs with `cached_since`/`cached_until` watermarks
 - `merged_prs_search:{author}:{repo}` - Merged PRs from GraphQL search (same watermarks, UTC)
 - `repo_info:{repo}` - Default branch and size (7 days)
-- `contributed_repos:{user}:{year}` - Repos with contributions in a completed calendar year (immutable)
+- `contributed_repos:{user}:{year}` - Repos with contributions in a completed calendar year (7 days; repos get renamed or transferred)
 - `fork_commits:{repo}:{pushed_at}` - A fork's commits ahead of its parent, until the fork is pushed to again (7 days)
 - `branch_commits_v3:{repo}:{branch}:{author}` - Branch commits with range-aware caching
 

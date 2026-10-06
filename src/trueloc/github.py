@@ -75,6 +75,7 @@ query($q: String!, $cursor: String) {
 }
 """
 PER_PAGE = 100  # Items per page for paginated REST endpoints
+GRAPHQL_REPOS_PER_QUERY = 100  # Aliased repository() fields per GraphQL request (cost 1)
 MAX_SEARCH_RESULTS = 1000  # GitHub search returns at most this many results per query
 # Clone a repo once this many commits need stats; below that, API requests are cheaper
 LOCAL_MIN_COMMITS = 20
@@ -291,7 +292,8 @@ class GitHubClient:
     def get_fork_parent(self, repo: str) -> dict[str, str] | None:
         """Get a fork's default branch and its parent, or None if it is not a fork.
 
-        Not cached, as a parent can rename its default branch.
+        Not cached, as a parent can rename its default branch (get_fork_commits caches
+        its result until the fork is pushed to again).
         """
         try:
             data = self._request(f"/repos/{repo}").json()
@@ -347,10 +349,10 @@ class GitHubClient:
         page = 1
         try:
             while True:
-                response = self._request(endpoint, params={"per_page": 100, "page": page})
+                response = self._request(endpoint, params={"per_page": PER_PAGE, "page": page})
                 page_commits = response.json()["commits"]
                 commits.extend(page_commits)
-                if len(page_commits) < 100:  # noqa: PLR2004
+                if len(page_commits) < PER_PAGE:
                     break
                 page += 1
         except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
@@ -400,27 +402,30 @@ class GitHubClient:
         repos: set[str] = set()
         now = datetime.now(UTC).replace(tzinfo=None)
         start = since - CONTRIBUTIONS_LOOKBACK
-        try:
-            # Calendar years (contributionsCollection spans at most a year), so windows are
-            # the same on every run and completed years can be cached
-            for year in range(start.year, until.year + 1):
-                year_start, year_end = _year_start(year), _year_start(year + 1)
+        # Calendar years (contributionsCollection spans at most a year), so windows are
+        # the same on every run and completed years can be cached
+        for year in range(start.year, until.year + 1):
+            year_start, year_end = _year_start(year), _year_start(year + 1)
+            try:
                 if year_end <= now - timedelta(days=1):
                     repos |= self._get_contributed_repos_in_year(username, year)
                 else:
                     repos |= self._fetch_contributed_repos(username, year_start, min(year_end, now))
-        except (httpx.HTTPStatusError, httpx.TimeoutException, GraphQLError) as e:
-            self._warn_skipped(username, "discovering contributed repos", e)
+            except (httpx.HTTPStatusError, httpx.TimeoutException, GraphQLError) as e:
+                self._warn_skipped(username, f"discovering contributed repos in {year}", e)
         return sorted(repos)
 
     def _get_contributed_repos_in_year(self, username: str, year: int) -> set[str]:
-        """Repos with contributions in a completed year, which no longer change."""
+        """Repos with contributions in a completed year, cached for a week.
+
+        Not forever: names change when repos are renamed or transferred, and so does access.
+        """
         cache_key = f"contributed_repos:{username}:{year}"
         cached = self.cache.get(cache_key)
         if cached is not None:
             return set(cached)
         repos = self._fetch_contributed_repos(username, _year_start(year), _year_start(year + 1))
-        self.cache.set(cache_key, sorted(repos), expire=TTL_IMMUTABLE)
+        self.cache.set(cache_key, sorted(repos), expire=TTL_MUTABLE)
         return repos
 
     def _fetch_prs_in_range(
@@ -769,7 +774,9 @@ class GitHubClient:
         """Save commits to cache with watermark dates.
 
         Uses TTL_IMMUTABLE since range-aware caching handles new commits by fetching gaps.
+        The cached range ends now at the latest, as later commits can still be pushed.
         """
+        until = min(until, datetime.now(UTC).replace(tzinfo=None))
         self.cache.set(
             cache_key,
             {
@@ -814,8 +821,8 @@ class GitHubClient:
         Repos that can't be accessed are left out.
         """
         pushed: dict[str, datetime] = {}
-        for i in range(0, len(repos), PER_PAGE):
-            chunk = repos[i : i + PER_PAGE]
+        for i in range(0, len(repos), GRAPHQL_REPOS_PER_QUERY):
+            chunk = repos[i : i + GRAPHQL_REPOS_PER_QUERY]
             fields = " ".join(
                 f"r{j}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)})"
                 " { pushedAt }"
@@ -828,7 +835,14 @@ class GitHubClient:
             except (httpx.HTTPStatusError, httpx.TimeoutException) as e:
                 self._warn_skipped("repos", "checking for new pushes", e)
                 continue
-            data = response.json().get("data") or {}
+            payload = response.json()
+            data = payload.get("data")
+            if data is None:
+                # E.g. rate limited; without pushedAt these repos are fetched as before
+                errors = payload.get("errors") or []
+                error = GraphQLError("; ".join(e.get("message", "") for e in errors))
+                self._warn_skipped("repos", "checking for new pushes", error)
+                continue
             for j, repo in enumerate(chunk):
                 node = data.get(f"r{j}")
                 if node and node.get("pushedAt"):
