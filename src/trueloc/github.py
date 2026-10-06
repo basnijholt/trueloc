@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -12,7 +12,13 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from trueloc.models import FileStats
-from trueloc.utils import RATE_LIMIT_BUFFER, TTL_IMMUTABLE, TTL_MUTABLE, get_file_extension
+from trueloc.utils import (
+    PR_REFRESH_INTERVAL,
+    RATE_LIMIT_BUFFER,
+    TTL_IMMUTABLE,
+    TTL_MUTABLE,
+    get_file_extension,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -158,6 +164,10 @@ class GitHubClient:
         result = []
         params = {"state": "closed", "sort": "updated", "direction": "desc"}
         for pr in self._paginate(f"/repos/{repo}/pulls", params):
+            # Sorted by updated_at desc, and merged_at <= updated_at, so no later PR can match
+            updated_at = pr.get("updated_at")
+            if updated_at and datetime.fromisoformat(updated_at).replace(tzinfo=None) < since:
+                break
             if pr["merged_at"] is None:
                 continue
             merged_at = datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None)
@@ -177,14 +187,20 @@ class GitHubClient:
             if datetime.fromisoformat(pr["merged_at"]).replace(tzinfo=None) >= since
         ]
 
-    def _save_pr_cache(self, cache_key: str, since: datetime, prs: list[dict[str, Any]]) -> None:
-        """Save PRs to cache with the given watermark date.
+    def _save_pr_cache(
+        self,
+        cache_key: str,
+        since: datetime,
+        until: datetime,
+        prs: list[dict[str, Any]],
+    ) -> None:
+        """Save PRs to cache with the given watermark dates.
 
         Uses TTL_IMMUTABLE since range-aware caching handles new PRs by fetching gaps.
         """
         self.cache.set(
             cache_key,
-            {"cached_since": since.isoformat(), "prs": prs},
+            {"cached_since": since.isoformat(), "cached_until": until.isoformat(), "prs": prs},
             expire=TTL_IMMUTABLE,
         )
 
@@ -198,28 +214,41 @@ class GitHubClient:
 
         Uses smart range-aware caching:
         - If cached range covers requested range, filter locally (instant)
+        - If the cache is older than PR_REFRESH_INTERVAL, fetch PRs merged since then
         - If requesting older data, fetch only the gap and merge
         """
         cache_key = f"merged_prs_v2:{repo}:{username}"
         cached = self.cache.get(cache_key)
+        now = datetime.now(UTC).replace(tzinfo=None)
 
         if cached is None:
             prs = self._fetch_prs_in_range(repo, username, since)
-            self._save_pr_cache(cache_key, since, prs)
+            self._save_pr_cache(cache_key, since, now, prs)
             return prs
 
         cached_since = datetime.fromisoformat(cached["cached_since"])
+        # Entries written before cached_until existed: unknown fetch time, refresh all
+        cached_until = datetime.fromisoformat(cached.get("cached_until", cached["cached_since"]))
         prs = cached["prs"]
 
-        # Requested range is within cached range - filter locally!
-        if since >= cached_since:
+        # Requested range is within cached range and cache is fresh - filter locally!
+        if since >= cached_since and now - cached_until < PR_REFRESH_INTERVAL:
             return self._filter_prs_since(prs, since)
 
+        # Fetch PRs merged after the cache was written
+        if now - cached_until >= PR_REFRESH_INTERVAL:
+            newer_prs = self._fetch_prs_in_range(repo, username, cached_until)
+            newer_numbers = {pr["number"] for pr in newer_prs}
+            prs = newer_prs + [pr for pr in prs if pr["number"] not in newer_numbers]
+            cached_until = now
+
         # Requesting older data - fetch the gap and merge
-        gap_prs = self._fetch_prs_in_range(repo, username, since, cached_since)
-        all_prs = gap_prs + prs
-        self._save_pr_cache(cache_key, since, all_prs)
-        return self._filter_prs_since(all_prs, since)
+        if since < cached_since:
+            prs = prs + self._fetch_prs_in_range(repo, username, since, cached_since)
+            cached_since = since
+
+        self._save_pr_cache(cache_key, cached_since, cached_until, prs)
+        return self._filter_prs_since(prs, since)
 
     def get_default_branch(self, repo: str) -> str | None:
         """Get the default branch for a repository."""
