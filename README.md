@@ -330,7 +330,9 @@ Congratulations! You've written over a million lines of code since 1y!
 
 - **Per-commit counting** (default): Counts every line touched in every commit
 - **Net diff mode**: Alternative mode that only counts final diff (`--net`)
-- **Direct commits**: Includes commits pushed directly to main (not via PR)
+- **All your repos**: Your own repos, plus every repo you contributed to (organizations, upstream projects, private repos)
+- **Direct commits**: Includes commits pushed directly to main (not via PR), without double counting squash, rebase, or merge commits of PRs
+- **Forks**: Counts commits in your own forks that aren't in the parent repo
 - **File extension breakdown**: Shows which languages you've worked with
 - **JSON output**: Machine-readable output for scripting (`--json`)
 - **Disk caching**: Uses diskcache to avoid hammering the GitHub API

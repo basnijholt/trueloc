@@ -137,8 +137,8 @@ Cache is stored in `~/.cache/trueloc/`.
 | Commit stats | Forever | Immutable once created |
 | PR commits | Forever | Immutable once merged |
 | PR files | Forever | Immutable once merged |
-| User repos | 1 day | Can change over time |
-| Merged PR lists | Incremental | Only fetches new PRs |
+| User repos | 7 days | Can change over time |
+| Merged PR lists | Incremental | Re-checked for newly merged PRs after 1 hour |
 
 ### Cache Management
 
