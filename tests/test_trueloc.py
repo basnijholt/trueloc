@@ -1250,6 +1250,155 @@ class TestGitHubClientPRStatsNet:
         assert by_ext[".py"].additions == 100
 
 
+class TestGitHubClientFailures:
+    """Failed API calls must not be cached as empty results."""
+
+    HEADERS = {"X-RateLimit-Remaining": "5000"}  # noqa: RUF012
+
+    def test_pr_stats_net_not_cached_on_error(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        route = respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/1/files",
+            params={"per_page": "100", "page": "1"},
+        ).mock(return_value=httpx.Response(500, headers=self.HEADERS))
+
+        assert gh_client.get_pr_stats_net("user/repo", 1) == (0, 0, {})
+
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                json=[{"filename": "a.py", "additions": 5, "deletions": 2}],
+                headers=self.HEADERS,
+            )
+        )
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/1/files",
+            params={"per_page": "100", "page": "2"},
+        ).mock(return_value=httpx.Response(200, json=[], headers=self.HEADERS))
+
+        adds, dels, _ = gh_client.get_pr_stats_net("user/repo", 1)
+        assert (adds, dels) == (5, 2)
+
+    def test_pr_stats_per_commit_not_cached_on_error(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/1/commits",
+            params={"per_page": "100", "page": "1"},
+        ).mock(return_value=httpx.Response(200, json=[{"sha": "abc"}], headers=self.HEADERS))
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/1/commits",
+            params={"per_page": "100", "page": "2"},
+        ).mock(return_value=httpx.Response(200, json=[], headers=self.HEADERS))
+        route = respx_mock.get("https://api.github.com/repos/user/repo/commits/abc").mock(
+            return_value=httpx.Response(500, headers=self.HEADERS)
+        )
+
+        assert gh_client.get_pr_stats_per_commit("user/repo", 1)[:2] == (0, 0)
+
+        route.mock(
+            return_value=httpx.Response(
+                200,
+                json={"files": [{"filename": "a.py", "additions": 5, "deletions": 2}]},
+                headers=self.HEADERS,
+            )
+        )
+        assert gh_client.get_pr_stats_per_commit("user/repo", 1)[:2] == (5, 2)
+
+    def test_pr_stats_per_commit_not_cached_when_commit_list_fails(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get(
+            "https://api.github.com/repos/user/repo/pulls/1/commits",
+            params={"per_page": "100", "page": "1"},
+        ).mock(return_value=httpx.Response(500, headers=self.HEADERS))
+
+        assert gh_client.get_pr_stats_per_commit("user/repo", 1)[:2] == (0, 0)
+        assert "pr_stats_per_commit:user/repo:1" not in gh_client.cache
+
+    def test_branch_commits_error_skips_repo(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """An empty repository returns 409; that must not abort the whole run."""
+        respx_mock.get("https://api.github.com/repos/user/repo/commits").mock(
+            return_value=httpx.Response(409, headers=self.HEADERS)
+        )
+        commits = gh_client.get_branch_commits(
+            "user/repo", "main", "user", datetime(2024, 1, 1), datetime(2024, 2, 1)
+        )
+        assert commits == []
+        assert "branch_commits_v2:user/repo:main:user" not in gh_client.cache
+
+    def test_merged_prs_error_skips_repo(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.get("https://api.github.com/repos/user/repo/pulls").mock(
+            return_value=httpx.Response(404, headers=self.HEADERS)
+        )
+        assert gh_client.get_merged_prs("user/repo", "user", datetime(2024, 1, 1)) == []
+        assert "merged_prs_v2:user/repo:user" not in gh_client.cache
+
+    def test_merged_prs_gap_error_returns_cached(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        cached_pr = {"number": 1, "merged_at": "2024-01-10T10:00:00Z", "user": {"login": "u"}}
+        gh_client.cache.set(
+            "merged_prs_v2:user/repo:u",
+            {"cached_since": "2024-01-08T00:00:00", "prs": [cached_pr]},
+        )
+        respx_mock.get("https://api.github.com/repos/user/repo/pulls").mock(
+            return_value=httpx.Response(500, headers=self.HEADERS)
+        )
+        assert gh_client.get_merged_prs("user/repo", "u", datetime(2024, 1, 1)) == [cached_pr]
+        # Watermark is not moved back, so the gap is retried next run
+        cached = gh_client.cache.get("merged_prs_v2:user/repo:u")
+        assert cached["cached_since"] == "2024-01-08T00:00:00"
+
+    def test_branch_commits_gap_error_returns_cached(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        commit = {"sha": "abc", "commit": {"author": {"date": "2024-01-10T10:00:00Z"}}}
+        gh_client.cache.set(
+            "branch_commits_v2:user/repo:main:u",
+            {
+                "cached_since": "2024-01-05T00:00:00",
+                "cached_until": "2024-01-20T00:00:00",
+                "commits": [commit],
+            },
+        )
+        respx_mock.get("https://api.github.com/repos/user/repo/commits").mock(
+            return_value=httpx.Response(500, headers=self.HEADERS)
+        )
+        commits = gh_client.get_branch_commits(
+            "user/repo", "main", "u", datetime(2024, 1, 1), datetime(2024, 2, 1)
+        )
+        assert commits == [commit]
+
+    def test_warnings_go_to_stderr(
+        self,
+        gh_client: GitHubClient,
+        respx_mock: respx.Router,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Warnings must not corrupt --json output on stdout."""
+        respx_mock.get("https://api.github.com/repos/user/repo/pulls").mock(
+            return_value=httpx.Response(404, headers=self.HEADERS)
+        )
+        gh_client.get_merged_prs("user/repo", "user", datetime(2024, 1, 1))
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Skipping PRs for user/repo (HTTP 404)" in captured.err
+
+    def test_warn_skipped_without_response(
+        self, gh_client: GitHubClient, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """_request raises HTTPStatusError(response=None) after exhausting retries."""
+        error = httpx.HTTPStatusError("failed", request=None, response=None)  # type: ignore[arg-type]
+        gh_client._warn_skipped("user/repo", "PRs", error)
+        assert "Skipping PRs for user/repo (HTTPStatusError)" in capsys.readouterr().err
+
+
 class TestProcessFunctions:
     """Tests for _process_pr and _process_direct_commits."""
 
@@ -1425,7 +1574,14 @@ class TestHelperFunctions:
 
         cache = get_cache(no_cache=True)
         assert cache is not None
+        cache.set("key", "value")
         cache.close()
+        # diskcache has no in-memory mode; ":memory:" would be a directory in the CWD
+        assert Path(cache.directory).name != ":memory:"
+        # A fresh no-cache instance must not see earlier entries
+        fresh = get_cache(no_cache=True)
+        assert fresh.get("key") is None
+        fresh.close()
 
     def test_get_cache_with_disk(self) -> None:
         """Test getting disk cache."""

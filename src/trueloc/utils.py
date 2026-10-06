@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import atexit
 import re
+import shutil
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -41,9 +43,12 @@ def get_github_token() -> str:
 
 
 def get_cache(no_cache: bool) -> diskcache.Cache:  # noqa: FBT001
-    """Get disk cache or in-memory cache."""
+    """Get disk cache, or a throwaway cache in a temporary directory."""
     if no_cache:
-        return diskcache.Cache(":memory:")
+        # diskcache has no in-memory mode, Cache() uses a fresh temporary directory
+        cache = diskcache.Cache()
+        atexit.register(shutil.rmtree, cache.directory, ignore_errors=True)
+        return cache
     return diskcache.Cache(str(CACHE_DIR))
 
 
