@@ -24,6 +24,7 @@ Cache lives at `~/.cache/trueloc/` using diskcache with SQLite backend.
 - `pr_stats_per_commit:{repo}:{pr_number}` - Per-commit PR stats (immutable)
 - `pr_stats_net:{repo}:{pr_number}` - Net diff PR stats (immutable)
 - `commit_stats:{repo}:{sha}` - Individual commit stats (immutable)
+- `user_repos_v2:{user}` - Owned non-fork repos (7 days)
 - `merged_prs_v2:{repo}:{author}` - Merged PRs with `cached_since`/`cached_until` watermarks
 - `branch_commits_v2:{repo}:{branch}:{author}` - Branch commits with range-aware caching
 
@@ -31,7 +32,7 @@ The `v2` keys use range-aware caching: they store `cached_since`/`cached_until` 
 
 ### GitHub API Flow
 
-1. `get_user_repos()` → all repos user has access to
+1. `get_user_repos()` → user's own non-fork repos, plus `get_contributed_repos()` → repos with PR/commit contributions (GraphQL `contributionsCollection`, includes other owners' and private repos)
 2. For each repo: `get_merged_prs()` → PRs merged by user since date
 3. For each PR: `get_pr_stats_per_commit()` or `get_pr_stats_net()`
 4. For direct commits: `get_branch_commits()` → `get_commit_stats()` for each
