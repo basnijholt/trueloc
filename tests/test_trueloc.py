@@ -407,12 +407,13 @@ class TestGitHubClientAPI:
         )
 
         assert repos == ["org/a", "org/c", "testuser/b"]
-        # Looks back a year before `since`, as PR contributions count at creation time
+        # Looks back a year before `since`, as PR contributions count at creation time;
+        # queried per calendar year
         assert route.call_count == 2
         first, last = (json.loads(call.request.content)["variables"] for call in route.calls)
         assert first["login"] == "testuser"
-        assert first["from"] == _utc(datetime(2023, 6, 2))
-        assert last["to"] == _utc(datetime(2024, 7, 1))
+        assert first["from"] == _utc(datetime(2023, 1, 1))
+        assert last["to"] == _utc(datetime(2025, 1, 1))
 
     def test_get_contributed_repos_splits_long_ranges(
         self, gh_client: GitHubClient, respx_mock: respx.Router
@@ -425,12 +426,12 @@ class TestGitHubClientAPI:
         gh_client.get_contributed_repos("testuser", datetime(2022, 1, 1), datetime(2024, 7, 1))
 
         windows = [json.loads(call.request.content)["variables"] for call in route.calls]
-        assert len(windows) == 4  # 2.5 years plus a year of lookback
+        assert len(windows) == 4  # Calendar years 2021 (lookback) to 2024
         for window in windows:
             start = datetime.fromisoformat(window["from"].rstrip("Z"))
             end = datetime.fromisoformat(window["to"].rstrip("Z"))
-            assert end - start <= timedelta(days=365)
-        assert windows[-1]["to"] == _utc(datetime(2024, 7, 1))
+            assert end - start <= timedelta(days=366)
+        assert windows[-1]["to"] == _utc(datetime(2025, 1, 1))
 
     def test_get_contributed_repos_bisects_when_truncated(
         self, gh_client: GitHubClient, respx_mock: respx.Router
@@ -488,15 +489,16 @@ class TestGitHubClientAPI:
                     },
                     headers={"X-RateLimit-Remaining": "5000"},
                 ),
+                self._contributions(["org/c"], []),
             ]
         )
         repos = gh_client.get_contributed_repos(
             "testuser", datetime(2023, 6, 1), datetime(2024, 7, 1)
         )
-        # Repos found before the error are kept, and the failure is reported
-        assert repos == ["org/a"]
+        # Years 2022 to 2024: other years still count, and the failure is reported
+        assert repos == ["org/a", "org/c"]
         err = capsys.readouterr().err
-        assert "Skipping discovering contributed repos for testuser (GraphQL: x)" in err
+        assert "Skipping discovering contributed repos in 2023 for testuser (GraphQL: x)" in err
 
     def test_get_contributed_repos_http_error_warns(
         self, gh_client: GitHubClient, respx_mock: respx.Router
@@ -546,9 +548,10 @@ class TestGitHubClientAPI:
             params={"type": "owner", "per_page": "100", "page": "2"},
         ).mock(return_value=httpx.Response(200, json=[], headers=headers))
 
-        assert gh_client.get_active_owned_forks("testuser", datetime(2024, 6, 1)) == [
-            "testuser/active"
-        ]
+        # With when they were pushed to, to cache their comparison until the next push
+        assert gh_client.get_active_owned_forks("testuser", datetime(2024, 6, 1)) == {
+            "testuser/active": datetime(2024, 6, 10)
+        }
 
     def test_get_fork_commits_only_ahead_of_parent(
         self, gh_client: GitHubClient, respx_mock: respx.Router

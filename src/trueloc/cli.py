@@ -104,20 +104,27 @@ def _process_direct_commits(  # noqa: PLR0913
     aggregator: StatsAggregator,
     *,
     is_owned_fork: bool = False,
+    pushed_at: datetime | None = None,
 ) -> None:
-    """Process direct commits for a repo and update aggregator."""
+    """Process direct commits for a repo and update aggregator.
+
+    `pushed_at` (when the repo was last pushed to) lets unchanged repos skip requests.
+    """
     if is_owned_fork:
-        branch_commits = gh.get_fork_commits(repo, username, since, until)
+        branch_commits = gh.get_fork_commits(repo, username, since, until, pushed_at=pushed_at)
     else:
         default_branch = gh.get_default_branch(repo)
         if not default_branch:
             return
-        branch_commits = gh.get_branch_commits(repo, default_branch, username, since, until)
+        branch_commits = gh.get_branch_commits(
+            repo, default_branch, username, since, until, pushed_at=pushed_at
+        )
 
     candidates = [
         commit
         for commit in branch_commits
         if commit["sha"] not in aggregator.pr_commit_shas
+        and commit["sha"] not in aggregator.direct_commit_shas
         # Merge commits duplicate the diff of the merged branch
         and len(commit.get("parents", [])) <= 1
         and _commit_fingerprint(commit) not in aggregator.pr_commit_fingerprints
@@ -156,27 +163,29 @@ def _discover_repos(
     repo: str | None,
     since: datetime,
     until: datetime,
-) -> tuple[list[str], set[str]]:
-    """Return the repos to scan, and which of them are the user's own forks."""
+) -> tuple[list[str], dict[str, datetime | None]]:
+    """Return the repos to scan, and the user's own forks with when they were pushed to."""
     if repo:
         # Single repo mode - construct full name if needed
         if "/" not in repo:
             repo = f"{username}/{repo}"
         is_own = repo.split("/")[0].lower() == username.lower()
-        return [repo], {repo} if is_own and gh.get_fork_parent(repo) else set()
+        return [repo], {repo: None} if is_own and gh.get_fork_parent(repo) else {}
 
     owned = gh.get_user_repos(username)
     contributed = gh.get_contributed_repos(username, since, until)
-    owned_forks = set(gh.get_active_owned_forks(username, since))
-    return sorted(set(owned) | set(contributed) | owned_forks), owned_forks
+    owned_forks: dict[str, datetime | None] = dict(gh.get_active_owned_forks(username, since))
+    return sorted(set(owned) | set(contributed) | set(owned_forks)), owned_forks
 
 
 def _canonical_repo(
-    repo: str, owned_forks: set[str], prs_by_repo: dict[str, list[dict[str, Any]]]
-) -> tuple[list[str], set[str]]:
+    repo: str,
+    owned_forks: dict[str, datetime | None],
+    prs_by_repo: dict[str, list[dict[str, Any]]],
+) -> tuple[list[str], dict[str, datetime | None]]:
     """Replace a repo name as typed with GitHub's spelling, if search found its PRs."""
     canonical = next((name for name in prs_by_repo if name.lower() == repo.lower()), repo)
-    return [canonical], {canonical} if repo in owned_forks else set()
+    return [canonical], {canonical: owned_forks[repo]} if repo in owned_forks else {}
 
 
 def _merged_prs_by_repo(  # noqa: PLR0913
@@ -307,7 +316,13 @@ def count(  # noqa: PLR0913
 
     with (
         get_cache(no_cache) as cache,
-        httpx.Client(base_url="https://api.github.com", headers=headers, timeout=30.0) as client,
+        httpx.Client(
+            base_url="https://api.github.com",
+            headers=headers,
+            timeout=30.0,
+            # Renamed or transferred repos redirect to their new name
+            follow_redirects=True,
+        ) as client,
         Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -343,11 +358,14 @@ def count(  # noqa: PLR0913
             if repo is None:
                 # Repos found by search too, e.g. with PRs opened long before `since`
                 repos = sorted(set(repos) | set(prs_by_repo))
+            # One request per 100 repos, so unchanged repos need no requests below
+            pushed = gh.get_pushed_at([name for name in repos if name not in owned_forks])
             commit_task = progress.add_task(
                 "[bold]Direct commits[/bold]", total=len(repos), status=""
             )
             for repo_name in repos:
                 progress.update(commit_task, status=repo_name.split("/")[-1][:20])
+                is_owned_fork = repo_name in owned_forks
                 _process_direct_commits(
                     gh,
                     repo_name,
@@ -355,7 +373,8 @@ def count(  # noqa: PLR0913
                     since_date,
                     until_date,
                     aggregator,
-                    is_owned_fork=repo_name in owned_forks,
+                    is_owned_fork=is_owned_fork,
+                    pushed_at=owned_forks[repo_name] if is_owned_fork else pushed.get(repo_name),
                 )
                 progress.advance(commit_task)
 
