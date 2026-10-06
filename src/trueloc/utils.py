@@ -22,6 +22,8 @@ TTL_MUTABLE = 604800  # 7 days for mutable data
 TTL_IMMUTABLE = None  # Never expires for immutable data
 PR_REFRESH_INTERVAL = timedelta(hours=1)  # Re-check for newly merged PRs after this
 REFRESH_OVERLAP = timedelta(minutes=10)  # Re-fetch this far before the last refresh
+# GitHub filters commits by committer date, and commits may be pushed long after that
+COMMIT_REFRESH_OVERLAP = timedelta(days=7)
 RATE_LIMIT_BUFFER = 500  # Proactively pause when remaining requests drop below this
 
 
@@ -53,7 +55,10 @@ def get_cache(no_cache: bool) -> diskcache.Cache:  # noqa: FBT001
 
 
 def to_utc(local: datetime) -> datetime:
-    """Convert a naive local datetime to naive UTC, the convention for GitHub dates."""
+    """Convert a naive local (or timezone-aware) datetime to naive UTC.
+
+    Naive UTC is the convention for all dates passed to GitHubClient, like GitHub's.
+    """
     return local.astimezone(UTC).replace(tzinfo=None)
 
 
@@ -73,7 +78,8 @@ def parse_date(date_str: str) -> datetime:
 
     parsed: datetime | None = dateparser.parse(
         date_str,
-        settings={"PREFER_DATES_FROM": "past", "RETURN_AS_TIMEZONE_AWARE": False},
+        # Naive local time, unless the input has a timezone (e.g. "2024-06-01T00:00:00Z")
+        settings={"PREFER_DATES_FROM": "past"},
     )
     if parsed is None:
         msg = f"Could not parse date: {date_str!r}"

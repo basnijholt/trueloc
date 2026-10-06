@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import subprocess
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
@@ -484,10 +484,11 @@ class TestSearchMergedPRs:
         route = respx_mock.post("https://api.github.com/graphql").mock(
             return_value=search_response([pr_node(1)])
         )
-        since = datetime.now() - timedelta(days=30)  # noqa: DTZ005
+        now = datetime.now(UTC).replace(tzinfo=None)
+        since = now - timedelta(days=30)
 
-        gh_client.search_merged_prs("testuser", since, datetime.now())  # noqa: DTZ005
-        prs = gh_client.search_merged_prs("testuser", since, datetime.now())  # noqa: DTZ005
+        gh_client.search_merged_prs("testuser", since, now)
+        prs = gh_client.search_merged_prs("testuser", since, now)
 
         assert route.call_count == 1
         assert prs is not None

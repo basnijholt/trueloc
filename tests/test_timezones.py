@@ -19,7 +19,7 @@ from typer.testing import CliRunner
 
 from trueloc.cli import app
 from trueloc.github import GitHubClient
-from trueloc.utils import to_utc
+from trueloc.utils import parse_date, to_utc
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -52,7 +52,14 @@ def commit(sha: str, date: str) -> dict[str, Any]:
 
 
 def test_to_utc() -> None:
-    assert to_utc(datetime(2024, 6, 1)) == datetime(2024, 6, 1, 4)
+    assert to_utc(datetime(2024, 6, 1)) == datetime(2024, 6, 1, 4)  # Daylight saving time
+    assert to_utc(datetime(2024, 1, 1)) == datetime(2024, 1, 1, 5)
+
+
+def test_explicit_timezone_in_dates_is_kept() -> None:
+    assert to_utc(parse_date("2024-06-01T00:00:00Z")) == datetime(2024, 6, 1)
+    assert to_utc(parse_date("2024-06-01T00:00:00+02:00")) == datetime(2024, 5, 31, 22)
+    assert to_utc(parse_date("2024-06-01")) == datetime(2024, 6, 1, 4)  # Local midnight
 
 
 class TestCountRange:
@@ -152,6 +159,35 @@ class TestBranchCommits:
         )
 
         assert [c["sha"] for c in commits] == ["boundary"]
+
+    def test_newer_fetch_overlaps_for_late_pushes(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """GitHub filters by committer date, so a commit made before the last run but
+        pushed after it is only found by re-fetching before the watermark."""
+        gh_client.cache.set(
+            "branch_commits_v3:u/r:main:u",
+            {
+                "cached_since": "2024-06-01T00:00:00",
+                "cached_until": "2024-06-15T00:00:00",
+                "commits": [],
+            },
+        )
+        late = commit("late", "2024-06-14T12:00:00Z")  # Committed before, pushed after
+        url = "https://api.github.com/repos/u/r/commits"
+        route = respx_mock.get(url, params__contains={"page": "1"}).mock(
+            return_value=httpx.Response(200, json=[late], headers=HEADERS)
+        )
+        respx_mock.get(url, params__contains={"page": "2"}).mock(
+            return_value=httpx.Response(200, json=[], headers=HEADERS)
+        )
+
+        commits = gh_client.get_branch_commits(
+            "u/r", "main", "u", datetime(2024, 6, 1), datetime(2024, 7, 1)
+        )
+
+        assert route.calls[0].request.url.params["since"] < "2024-06-14T12:00:00Z"
+        assert [c["sha"] for c in commits] == ["late"]
 
     def test_ignores_cache_with_local_time_watermarks(
         self, gh_client: GitHubClient, respx_mock: respx.Router

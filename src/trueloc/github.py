@@ -15,6 +15,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from trueloc.local import get_commits_numstat, get_existing_commits, get_pr_commits_local
 from trueloc.models import FileStats
 from trueloc.utils import (
+    COMMIT_REFRESH_OVERLAP,
     PR_REFRESH_INTERVAL,
     RATE_LIMIT_BUFFER,
     REFRESH_OVERLAP,
@@ -339,7 +340,6 @@ class GitHubClient:
         """Fetch repos with PR or commit contributions in a range of at most a year."""
         variables = {
             "login": username,
-            # Naive datetimes are local time
             "from": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "to": until.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
@@ -371,7 +371,10 @@ class GitHubClient:
         return repos
 
     def get_contributed_repos(self, username: str, since: datetime, until: datetime) -> list[str]:
-        """Get all repos (including other owners' and private) the user contributed to."""
+        """Get all repos (including other owners' and private) the user contributed to.
+
+        `since` and `until` are naive UTC, like all dates in GitHubClient.
+        """
         repos: set[str] = set()
         start = since - CONTRIBUTIONS_LOOKBACK
         try:
@@ -519,7 +522,7 @@ class GitHubClient:
         until: datetime,
         repo: str | None = None,
     ) -> list[dict[str, Any]] | None:
-        """Get PRs by a user merged in [since, until] across all repos, via GraphQL search.
+        """Get PRs by a user merged in [since, until] (naive UTC) across repos, via search.
 
         A few requests per thousand PRs, instead of listing every repo's PRs. PRs have
         the REST fields used elsewhere, plus `repo`, `commit_count`, and `disk_usage`
@@ -799,10 +802,10 @@ class GitHubClient:
             )
             commits = older_commits + commits
 
-        # Fetch newer commits if needed
+        # Fetch newer commits if needed; overlap to find commits pushed after the last run
         if until > cached_until:
             newer_commits = self._fetch_commits_in_range(
-                repo, branch, username, cached_until, until
+                repo, branch, username, cached_until - COMMIT_REFRESH_OVERLAP, until
             )
             commits = commits + newer_commits
 

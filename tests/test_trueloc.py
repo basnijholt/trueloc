@@ -1392,7 +1392,7 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": "2024-01-20T00:00:00Z",
+                "since": "2024-01-13T00:00:00Z",  # cached_until - COMMIT_REFRESH_OVERLAP
                 "until": "2024-01-31T00:00:00Z",
                 "per_page": "100",
                 "page": "1",
@@ -1411,7 +1411,7 @@ class TestGitHubClientBranchCommits:
             params={
                 "sha": "main",
                 "author": "testuser",
-                "since": "2024-01-20T00:00:00Z",
+                "since": "2024-01-13T00:00:00Z",  # cached_until - COMMIT_REFRESH_OVERLAP
                 "until": "2024-01-31T00:00:00Z",
                 "per_page": "100",
                 "page": "2",
