@@ -220,7 +220,9 @@ def count(  # noqa: PLR0913, PLR0915
             repos = [repo]
         else:
             fetch_task = progress.add_task("Fetching repositories...", total=None, status="")
-            repos = gh.get_user_repos(username)
+            owned = gh.get_user_repos(username)
+            contributed = gh.get_contributed_repos(username, since_date, until_date)
+            repos = sorted(set(owned) | set(contributed))
             progress.remove_task(fetch_task)
 
         # Main repo progress

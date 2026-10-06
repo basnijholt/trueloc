@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,11 @@ if TYPE_CHECKING:
 # =============================================================================
 # Fixtures
 # =============================================================================
+
+
+def _utc(dt: datetime) -> str:
+    """Format a naive local datetime as the UTC string sent to GraphQL."""
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @pytest.fixture
@@ -350,8 +356,9 @@ class TestGitHubClientAPI:
             return_value=httpx.Response(
                 200,
                 json=[
-                    {"full_name": "testuser/repo1"},
-                    {"full_name": "testuser/repo2"},
+                    {"full_name": "testuser/repo1", "fork": False},
+                    {"full_name": "testuser/repo2", "fork": False},
+                    {"full_name": "testuser/forked", "fork": True},
                 ],
                 headers={"X-RateLimit-Remaining": "5000"},
             )
@@ -373,6 +380,134 @@ class TestGitHubClientAPI:
             repos = gh.get_user_repos("testuser")
 
         assert repos == ["testuser/repo1", "testuser/repo2"]
+
+    @staticmethod
+    def _contributions(prs: list[str], commits: list[str]) -> httpx.Response:
+        def by_repo(names: list[str]) -> list[dict[str, Any]]:
+            return [{"repository": {"nameWithOwner": name}} for name in names]
+
+        collection = {
+            "pullRequestContributionsByRepository": by_repo(prs),
+            "commitContributionsByRepository": by_repo(commits),
+        }
+        return httpx.Response(
+            200,
+            json={"data": {"user": {"contributionsCollection": collection}}},
+            headers={"X-RateLimit-Remaining": "5000"},
+        )
+
+    def test_get_contributed_repos(self, gh_client: GitHubClient, respx_mock: respx.Router) -> None:
+        """Repos the user contributed to, including ones owned by others."""
+        route = respx_mock.post("https://api.github.com/graphql").mock(
+            return_value=self._contributions(["org/a", "testuser/b"], ["org/a", "org/c"])
+        )
+
+        repos = gh_client.get_contributed_repos(
+            "testuser", datetime(2024, 6, 1), datetime(2024, 7, 1)
+        )
+
+        assert repos == ["org/a", "org/c", "testuser/b"]
+        # Looks back a year before `since`, as PR contributions count at creation time
+        assert route.call_count == 2
+        first, last = (json.loads(call.request.content)["variables"] for call in route.calls)
+        assert first["login"] == "testuser"
+        assert first["from"] == _utc(datetime(2023, 6, 2))
+        assert last["to"] == _utc(datetime(2024, 7, 1))
+
+    def test_get_contributed_repos_splits_long_ranges(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """contributionsCollection spans at most one year, so longer ranges are split."""
+        route = respx_mock.post("https://api.github.com/graphql").mock(
+            return_value=self._contributions(["org/a"], [])
+        )
+
+        gh_client.get_contributed_repos("testuser", datetime(2022, 1, 1), datetime(2024, 7, 1))
+
+        windows = [json.loads(call.request.content)["variables"] for call in route.calls]
+        assert len(windows) == 4  # 2.5 years plus a year of lookback
+        for window in windows:
+            start = datetime.fromisoformat(window["from"].rstrip("Z"))
+            end = datetime.fromisoformat(window["to"].rstrip("Z"))
+            assert end - start <= timedelta(days=365)
+        assert windows[-1]["to"] == _utc(datetime(2024, 7, 1))
+
+    def test_get_contributed_repos_bisects_when_truncated(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        """At most 100 repos are returned per query; bisect the range when that is hit."""
+        many = [f"org/repo{i}" for i in range(100)]
+        respx_mock.post("https://api.github.com/graphql").mock(
+            side_effect=[
+                self._contributions([], []),  # Lookback window
+                self._contributions(many, []),
+                self._contributions(["org/early"], []),
+                self._contributions(["org/late"], []),
+            ]
+        )
+
+        repos = gh_client.get_contributed_repos(
+            "testuser", datetime(2024, 6, 1), datetime(2024, 7, 1)
+        )
+
+        assert set(repos) == {*many, "org/early", "org/late"}
+
+    def test_get_contributed_repos_unknown_user(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.post("https://api.github.com/graphql").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": {"user": None},
+                    "errors": [{"type": "NOT_FOUND", "message": "Could not resolve"}],
+                },
+                headers={"X-RateLimit-Remaining": "5000"},
+            )
+        )
+        assert (
+            gh_client.get_contributed_repos("nobody", datetime(2024, 6, 1), datetime(2024, 7, 1))
+            == []
+        )
+
+    def test_get_contributed_repos_graphql_error_warns(
+        self,
+        gh_client: GitHubClient,
+        respx_mock: respx.Router,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Non-NOT_FOUND GraphQL errors must not look like "no contributions"."""
+        respx_mock.post("https://api.github.com/graphql").mock(
+            side_effect=[
+                self._contributions(["org/a"], []),
+                httpx.Response(
+                    200,
+                    json={
+                        "data": {"user": None},
+                        "errors": [{"type": "VALIDATION", "message": "x"}],
+                    },
+                    headers={"X-RateLimit-Remaining": "5000"},
+                ),
+            ]
+        )
+        repos = gh_client.get_contributed_repos(
+            "testuser", datetime(2023, 6, 1), datetime(2024, 7, 1)
+        )
+        # Repos found before the error are kept, and the failure is reported
+        assert repos == ["org/a"]
+        err = capsys.readouterr().err
+        assert "Skipping discovering contributed repos for testuser (GraphQL: x)" in err
+
+    def test_get_contributed_repos_http_error_warns(
+        self, gh_client: GitHubClient, respx_mock: respx.Router
+    ) -> None:
+        respx_mock.post("https://api.github.com/graphql").mock(
+            return_value=httpx.Response(502, headers={"X-RateLimit-Remaining": "5000"})
+        )
+        repos = gh_client.get_contributed_repos(
+            "testuser", datetime(2024, 6, 1), datetime(2024, 7, 1)
+        )
+        assert repos == []
 
     def test_get_default_branch(
         self, memory_cache: diskcache.Cache, respx_mock: respx.Router

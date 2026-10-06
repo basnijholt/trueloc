@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -27,6 +27,29 @@ if TYPE_CHECKING:
     import diskcache  # type: ignore[import-untyped]
 
 console = Console(stderr=True)  # Keep stdout clean for --json
+
+CONTRIBUTED_REPOS_QUERY = """
+query($login: String!, $from: DateTime!, $to: DateTime!) {
+  user(login: $login) {
+    contributionsCollection(from: $from, to: $to) {
+      pullRequestContributionsByRepository(maxRepositories: 100) {
+        repository { nameWithOwner }
+      }
+      commitContributionsByRepository(maxRepositories: 100) {
+        repository { nameWithOwner }
+      }
+    }
+  }
+}
+"""
+MAX_CONTRIBUTED_REPOS = 100  # maxRepositories limit of contributionsCollection
+MAX_CONTRIBUTIONS_WINDOW = timedelta(days=365)  # contributionsCollection spans at most a year
+# PR contributions count when a PR is opened, so look back to catch PRs merged later
+CONTRIBUTIONS_LOOKBACK = timedelta(days=365)
+
+
+class GraphQLError(Exception):
+    """GraphQL request returned errors (GraphQL reports these with HTTP 200)."""
 
 
 class GitHubClient:
@@ -89,11 +112,14 @@ class GitHubClient:
         endpoint: str,
         params: dict[str, Any] | None = None,
         max_retries: int = 3,
+        *,
+        method: str = "GET",
+        json: dict[str, Any] | None = None,
     ) -> httpx.Response:
         """Make a request with rate limit handling."""
         response: httpx.Response | None = None
         for _attempt in range(max_retries):
-            response = self.client.get(endpoint, params=params)
+            response = self.client.request(method, endpoint, params=params, json=json)
 
             if self._is_rate_limited(response):
                 self._wait_for_rate_limit(response)
@@ -148,6 +174,8 @@ class GitHubClient:
         """Report a skipped API call, so missing data is not silent."""
         if isinstance(error, httpx.HTTPStatusError) and error.response is not None:
             reason = f" (HTTP {error.response.status_code})"
+        elif isinstance(error, GraphQLError):
+            reason = f" (GraphQL: {error})"
         elif error is not None:
             reason = f" ({type(error).__name__})"
         else:
@@ -156,13 +184,63 @@ class GitHubClient:
 
     def get_user_repos(self, username: str) -> list[str]:
         """Get all repositories for a user."""
-        cache_key = f"user_repos:{username}"
+        cache_key = f"user_repos_v2:{username}"
 
         def fetch() -> list[str]:
             repos_iter = self._paginate(f"/users/{username}/repos", {"type": "owner"})
-            return [repo["full_name"] for repo in repos_iter]
+            # Forks contain synced upstream commits; PRs merged in forks are found via
+            # get_contributed_repos
+            return [repo["full_name"] for repo in repos_iter if not repo["fork"]]
 
         return self._cached_fetch(cache_key, fetch, TTL_MUTABLE) or []
+
+    def _fetch_contributed_repos(self, username: str, since: datetime, until: datetime) -> set[str]:
+        """Fetch repos with PR or commit contributions in a range of at most a year."""
+        variables = {
+            "login": username,
+            # Naive datetimes are local time
+            "from": since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "to": until.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        response = self._request(
+            "/graphql",
+            method="POST",
+            json={"query": CONTRIBUTED_REPOS_QUERY, "variables": variables},
+        )
+        payload = response.json()
+        errors = payload.get("errors") or []
+        if errors:
+            # Unknown login (e.g. an organization): nothing to discover
+            if all(error.get("type") == "NOT_FOUND" for error in errors):
+                return set()
+            raise GraphQLError("; ".join(error.get("message", "") for error in errors))
+        collection = payload["data"]["user"]["contributionsCollection"]
+        groups = [
+            collection["pullRequestContributionsByRepository"],
+            collection["commitContributionsByRepository"],
+        ]
+        repos = {c["repository"]["nameWithOwner"] for group in groups for c in group}
+
+        # Results were truncated: split the range in half
+        truncated = any(len(group) >= MAX_CONTRIBUTED_REPOS for group in groups)
+        if truncated and until - since > timedelta(days=1):
+            middle = since + (until - since) / 2
+            repos |= self._fetch_contributed_repos(username, since, middle)
+            repos |= self._fetch_contributed_repos(username, middle, until)
+        return repos
+
+    def get_contributed_repos(self, username: str, since: datetime, until: datetime) -> list[str]:
+        """Get all repos (including other owners' and private) the user contributed to."""
+        repos: set[str] = set()
+        start = since - CONTRIBUTIONS_LOOKBACK
+        try:
+            while start < until:
+                end = min(start + MAX_CONTRIBUTIONS_WINDOW, until)
+                repos |= self._fetch_contributed_repos(username, start, end)
+                start = end
+        except (httpx.HTTPStatusError, httpx.TimeoutException, GraphQLError) as e:
+            self._warn_skipped(username, "discovering contributed repos", e)
+        return sorted(repos)
 
     def _fetch_prs_in_range(
         self,
